@@ -1,7 +1,7 @@
-# C2 — stdlib only. La dépendance externe.
+# GUNSKA — stdlib only, no external dependency.
 # app.py    : http.server, urllib, base64, threading, secrets
 # agent.py  : urllib, subprocess, tarfile, platform
 # console.py: urllib, json, argparse
 #
-# Ma tzidch hna 7ta 7aja khassha compilation (psycopg, cryptography...)
-# Railway/kayb9a Dockerfile → had l'file kayt9ra ghir ila bdel l'builder.
+# Build goes through the Dockerfile (python:3.11-slim). Do not add anything
+# that needs compilation (psycopg, cryptography, ...).
