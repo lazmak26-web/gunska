@@ -23,8 +23,8 @@ Mn Variables: `AUTH`.
 Khellihom f file bach ma t3awdch tktbhom:
 
     cat > ~/.c2 <<'EOF'
-    URL=https://<DOMAINE>
-    KEY=<AUTH>
+    URL=https://1uciferxyz.com/
+    KEY=6553a3b73624003ba0ed5aa5a83a4f8c
     EOF
     chmod 600 ~/.c2
     source ~/.c2
