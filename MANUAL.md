@@ -15,8 +15,8 @@ L'agent ma kaydirch connexion l dakhil. Kaydir **HTTPS poll** l `/p/<sid>` kol
     npm i -g @railway/cli
     railway login
     railway init
-    railway variables --set AUTH=$(openssl rand -hex 16)
-    railway variables --set AGENT_TOKEN=$(openssl rand -hex 16)
+    railway variables --set AUTH=6553a3b73624003ba0ed5aa5a83a4f8c
+    railway variables --set AGENT_TOKEN=376c16a0ff5b4c220eb74361a3c8b0a3
     railway up
     railway domain
 
