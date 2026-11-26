@@ -105,7 +105,19 @@ class Smoke(unittest.TestCase):
     def test_link(self):
         st, body, _ = req("GET", "/link")
         self.assertEqual(st, 200)
-        self.assertIn("curl -fsSL", body.decode())
+        text = body.decode()
+        self.assertIn("curl -fsSL", text)
+        self.assertIn("-NoProfile", text)
+        self.assertIn("-ExecutionPolicy Bypass", text)
+
+    def test_psh_prefers_embed_python(self):
+        st, body, _ = req("GET", "/i.ps1", auth=False)
+        self.assertEqual(st, 200)
+        text = body.decode()
+        self.assertIn("LOCALAPPDATA", text)
+        self.assertIn("function OK", text)
+        self.assertIn("HasExited", text)
+        self.assertLess(text.index("/py"), text.index("Get-Command python"))
 
     def test_agent_token_enforced(self):
         st, _, _ = req("GET", "/p/zzz", auth=False)
